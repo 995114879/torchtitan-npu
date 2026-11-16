@@ -196,16 +196,27 @@ bash scripts/run_train.sh \
 
 ### 加载量化 HF 权重
 
-`initial_load_in_hf_quantized` 目前只对 `deepseek_v4` 生效：其 state-dict adapter 会按目录内容
-自动探测两种 MX 量化格式，无需额外的格式开关：
+`initial_load_in_hf_quantized` 启用后，由 state-dict adapter 按模型和目录内容选择 reader，
+无需额外的格式开关：
 
-- 固定格式 MX：`.weight`（mxfp8 为 `float8_e4m3fn`，mxfp4 为打包的 `uint8`）与 e8m0 `.scale`
-  成对存放的目录。
-- torchao 协议：`torchtitan_npu/tools/checkpoint_conversion/export_quantized_hf.py` 导出的目录，
-  量化元数据写在 safetensors 的 `__metadata__` 中。探测时优先于固定格式 MX。
+- `deepseek_v4`：自动探测两种 MX 量化格式。
+  - 固定格式 MX：`.weight`（mxfp8 为 `float8_e4m3fn`，mxfp4 为打包字节，safetensors 标签为
+    `uint8` 或 `int8` 均可）与 e8m0 `.scale` 成对存放的目录。`.scale` 按行分块（每个 32 列块一个
+    系数）或按 DeepSeek 官方 attn/shared_experts 的 32×32 二维分块存放均可，读取时在 CPU 侧展开
+    为行式后交给反量化 kernel。
+  - torchao 协议：`torchtitan_npu/tools/checkpoint_conversion/export_quantized_hf.py` 导出的目录，
+    量化元数据写在 safetensors 的 `__metadata__` 中。探测时优先于固定格式 MX。
+- `deepseek_v4_1`：官方 MXFP8 整包目录由组合 reader 按 FQN 路由，与训练目标是否配置 Engram 表
+  无关（未配置时官方 Engram 张量保留在元数据中但不被读取）——Engram
+  row/block MX 交给 Engram reader，非 Engram 的固定格式 MX 对交给 MX reader（`.scale` 可以与
+  权重不在同一 shard，单个张量也可以跨多个 shard；官方包的 attn/shared_experts 为 32×32 分块
+  e8m0 scale，routed experts 为 int8 标签的打包 MXFP4，均在支持范围内），普通 bf16/f32 张量走上游
+  HF 读取路径。
+  训练目标未引用的额外张量（如 MTP、vision）保持不动，不被读取；不受支持的量化格式在被读取时
+  明确报错，不会静默加载错误权重。
 
-其他模型（含 `deepseek_v4_1`）的 adapter 不会选择这两个 MX reader，对这类目录启用该标志只会
-报出与量化无关的错误；此类模型请先使用反量化后的 bf16 权重。
+其他模型的 adapter 不会选择这些 MX reader，对这类目录启用该标志只会报出与量化无关的错误；
+此类模型请先使用反量化后的 bf16 权重。
 
 ## 保存 Hugging Face 权重
 

@@ -208,8 +208,24 @@ def test_engram_hf_shard_load_and_export(tmp_path, shards):
     torch.testing.assert_close(restored["layers.1.engram.embed.weight"], weight, rtol=0, atol=0)
 
 
+def test_engramless_official_reader_selection():
+    """from_quantized selects the official-package reader even with no Engram layers.
+
+    The debug-shrink host RAM budget can force engram_enabled=False; the official
+    Engram tensors then stay unread, but the MX/plain routing must still work.
+    """
+    from torchtitan_npu.extensions.mx_storage_reader.official_hf_storage import OfficialMxHuggingFaceStorageReader
+
+    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    for layer in config.layers:
+        layer.engram = None
+    adapter = DeepSeekV41StateDictAdapter(config, None)
+    assert adapter._engram_table_shapes() == {}
+    assert isinstance(adapter.get_hf_storage_reader("unused", from_quantized=True), OfficialMxHuggingFaceStorageReader)
+
+
 def test_engram_quantized_hf_mapping():
-    """The adapter selects the CPU reader and maps official Engram keys."""
+    """The adapter selects the official-package reader and maps official Engram keys."""
     config = model_registry("deepseek_v4_1_debugmodel_text").model
     table = config.layers[1].engram.table
     table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
@@ -225,8 +241,13 @@ def test_engram_quantized_hf_mapping():
         "layers.1.engram.wkv.scale": torch.tensor([[1.0, 2.0], [4.0, 8.0]]).to(torch.float8_e8m0fnu),
     }
     from torchtitan_npu.extensions.mx_storage_reader.engram import EngramHuggingFaceStorageReader
+    from torchtitan_npu.extensions.mx_storage_reader.official_hf_storage import OfficialMxHuggingFaceStorageReader
 
-    assert isinstance(adapter.get_hf_storage_reader("unused", from_quantized=True), EngramHuggingFaceStorageReader)
+    assert isinstance(adapter.get_hf_storage_reader("unused", from_quantized=True), OfficialMxHuggingFaceStorageReader)
+    assert isinstance(
+        adapter.get_hf_storage_reader("unused", from_quantized=False),
+        EngramHuggingFaceStorageReader,
+    )
     gate = torch.repeat_interleave(torch.repeat_interleave(torch.tensor([[2.0, 4.0], [8.0, 16.0]]), 32, 0), 32, 1)
     direct = adapter.from_hf(
         weights

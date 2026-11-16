@@ -112,6 +112,7 @@ class SafetensorsReaderMixin:
             metadata.storage_meta = StorageMeta()
         metadata.storage_meta.load_id = self.load_id
         self._raw_tensor_metadata = state_dict_metadata
+        self._raw_metadata = dict(state_dict_metadata)
         self._raw_storage_data = storage_data.copy()
         return metadata
 

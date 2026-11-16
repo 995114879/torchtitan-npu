@@ -42,16 +42,17 @@ class MXTensorDescriptor:
     scale_key: str
     qdata_metadata: TensorStorageMetadata
     scale_metadata: TensorStorageMetadata
+    row_block: int = 1
 
     @property
     def packing(self) -> int:
-        return 2 if self.qdata_metadata.properties.dtype == torch.uint8 else 1
+        return 2 if self.qdata_metadata.properties.dtype in (torch.uint8, torch.int8) else 1
 
 
 def get_mx_regions(
     req: ReadItem,
     descriptor: MXTensorDescriptor,
-) -> tuple[ChunkStorageMetadata, ChunkStorageMetadata, int]:
+) -> tuple[ChunkStorageMetadata, ChunkStorageMetadata, int, int]:
     saved_offsets = req.storage_index.offset
     if saved_offsets is None:
         raise ValueError(f"Missing saved offsets for MX tensor {descriptor.qdata_key}")
@@ -72,11 +73,28 @@ def get_mx_regions(
     )
     scale_k_start = aligned_k_start // MX_BLOCK_SIZE
     scale_k_end = (aligned_k_end + MX_BLOCK_SIZE - 1) // MX_BLOCK_SIZE
+
+    if descriptor.row_block == 1:
+        scale_region = ChunkStorageMetadata(
+            offsets=torch.Size((*global_start[:-1], scale_k_start)),
+            sizes=torch.Size((*req.lengths[:-1], scale_k_end - scale_k_start)),
+        )
+        return qdata_region, scale_region, int(global_start[-1]) - aligned_k_start, 0
+
+    # Blocked scales tile rows too: row_crop counts expanded rows preceding the request.
+    rows_start, rows = int(global_start[-2]), int(req.lengths[-2])
+    block_start = rows_start // descriptor.row_block
+    block_end = -(-(rows_start + rows) // descriptor.row_block)
     scale_region = ChunkStorageMetadata(
-        offsets=torch.Size((*global_start[:-1], scale_k_start)),
-        sizes=torch.Size((*req.lengths[:-1], scale_k_end - scale_k_start)),
+        offsets=torch.Size((*global_start[:-2], block_start, scale_k_start)),
+        sizes=torch.Size((*req.lengths[:-2], block_end - block_start, scale_k_end - scale_k_start)),
     )
-    return qdata_region, scale_region, int(global_start[-1]) - aligned_k_start
+    return (
+        qdata_region,
+        scale_region,
+        int(global_start[-1]) - aligned_k_start,
+        rows_start - block_start * descriptor.row_block,
+    )
 
 
 class MXHuggingFaceStorageReader(SafetensorsReaderMixin, HuggingFaceStorageReader):
@@ -102,10 +120,10 @@ class MXHuggingFaceStorageReader(SafetensorsReaderMixin, HuggingFaceStorageReade
         self._mx_tensors = {}
         self._raw_storage_data = {}
 
-    def read_metadata(self) -> Metadata:
+    def read_metadata(self, *, skip: set[str] | None = None, defer_unsupported: bool = False) -> Metadata:
         metadata = self.read_raw_metadata()
         storage_data = metadata.storage_data
-        self._mx_tensors = self._discover_mx_tensors(metadata)
+        self._mx_tensors = self._discover_mx_tensors(metadata, skip=skip, defer_unsupported=defer_unsupported)
         for key, descriptor in self._mx_tensors.items():
             raw = descriptor.qdata_metadata
             packing = descriptor.packing
@@ -131,32 +149,68 @@ class MXHuggingFaceStorageReader(SafetensorsReaderMixin, HuggingFaceStorageReade
         return metadata
 
     @staticmethod
-    def _discover_mx_tensors(metadata: Metadata) -> dict[str, MXTensorDescriptor]:
+    def _discover_mx_tensors(
+        metadata: Metadata,
+        *,
+        skip: set[str] | None = None,
+        defer_unsupported: bool = False,
+    ) -> dict[str, MXTensorDescriptor]:
+        # defer_unsupported skips out-of-protocol pairs instead of failing the whole
+        # directory; the composite reader's Engram guard fails them at request time.
         tensors: dict[str, MXTensorDescriptor] = {}
+        skip = skip or set()
         for qdata_key, scale_key in weight_scale_pairs(metadata.state_dict_metadata).items():
+            if qdata_key in skip or scale_key in skip:
+                continue
             qdata_md = metadata.state_dict_metadata[qdata_key]
             if not isinstance(qdata_md, TensorStorageMetadata) or qdata_md.properties.dtype not in (
                 torch.float8_e4m3fn,
                 torch.uint8,
+                torch.int8,
             ):
                 continue
             scale_md = metadata.state_dict_metadata.get(scale_key)
             if scale_md is None:
                 continue
+
             if not qdata_md.size or any(size <= 0 for size in qdata_md.size):
-                raise ValueError(f"Invalid MX weight shape for {qdata_key}: {qdata_md.size}")
+                if not defer_unsupported:
+                    raise ValueError(f"Invalid MX weight shape for {qdata_key}: {qdata_md.size}")
+                continue
             if not isinstance(scale_md, TensorStorageMetadata):
-                raise ValueError(f"Missing MX scale tensor for {qdata_key}: expected {scale_key}")
+                if not defer_unsupported:
+                    raise ValueError(f"Missing MX scale tensor for {qdata_key}: expected {scale_key}")
+                continue
             if scale_md.properties.dtype not in (torch.uint8, torch.float8_e8m0fnu):
-                raise ValueError(f"MX scale must contain E8M0 bytes: {scale_key}")
-            packing = 2 if qdata_md.properties.dtype == torch.uint8 else 1
+                if not defer_unsupported:
+                    raise ValueError(f"MX scale must contain E8M0 bytes: {scale_key}")
+                continue
+            packing = 2 if qdata_md.properties.dtype in (torch.uint8, torch.int8) else 1
             num_blocks = (qdata_md.size[-1] * packing + MX_BLOCK_SIZE - 1) // MX_BLOCK_SIZE
-            expected_scale_shape = torch.Size((*qdata_md.size[:-1], num_blocks))
-            if scale_md.size != expected_scale_shape:
-                raise ValueError(
-                    f"Invalid MX scale shape for {scale_key}: {scale_md.size}, expected {expected_scale_shape}"
+            rowwise_shape = torch.Size((*qdata_md.size[:-1], num_blocks))
+            blocked_shape = (
+                torch.Size(
+                    (
+                        *qdata_md.size[:-2],
+                        (int(qdata_md.size[-2]) + MX_BLOCK_SIZE - 1) // MX_BLOCK_SIZE,
+                        num_blocks,
+                    )
                 )
-            tensors[qdata_key] = MXTensorDescriptor(qdata_key, scale_key, qdata_md, scale_md)
+                if len(qdata_md.size) >= 2
+                else None
+            )
+            if scale_md.size == rowwise_shape:
+                row_block = 1
+            elif blocked_shape is not None and scale_md.size == blocked_shape:
+                row_block = MX_BLOCK_SIZE
+            elif not defer_unsupported:
+                raise ValueError(
+                    f"Invalid MX scale shape for {scale_key}: {scale_md.size}, expected rowwise "
+                    f"{rowwise_shape} or {MX_BLOCK_SIZE}-row-blocked {blocked_shape}"
+                )
+            else:
+                continue
+            tensors[qdata_key] = MXTensorDescriptor(qdata_key, scale_key, qdata_md, scale_md, row_block)
         if tensors and any(key.endswith(".weight_scale_inv") for key in metadata.state_dict_metadata):
             raise ValueError("Mixed MX and block FP8 checkpoints are not supported")
         return tensors
@@ -168,7 +222,7 @@ class MXHuggingFaceStorageReader(SafetensorsReaderMixin, HuggingFaceStorageReade
         req: ReadItem,
         descriptor: MXTensorDescriptor,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        qdata_region, scale_region, crop_start = get_mx_regions(req, descriptor)
+        qdata_region, scale_region, crop_start, row_crop = get_mx_regions(req, descriptor)
         qdata = self._read_tensor_region(
             descriptor.qdata_key,
             descriptor.qdata_metadata,
@@ -183,6 +237,13 @@ class MXHuggingFaceStorageReader(SafetensorsReaderMixin, HuggingFaceStorageReade
             qdata_file_path,
             qdata_file,
         )
+        if qdata.dtype == torch.int8:
+            # Packed MXFP4 is tagged I8 by safetensors; the dequant kernel takes unsigned bytes.
+            qdata = qdata.contiguous().view(torch.uint8)
+        if descriptor.row_block > 1:
+            # Expand to the kernel's rowwise contract; the uint8 view keeps ops off E8M0 storage.
+            scale = scale.contiguous().view(torch.uint8)
+            scale = scale.repeat_interleave(descriptor.row_block, dim=-2).narrow(-2, row_crop, qdata.shape[-2])
         return qdata, scale, crop_start
 
     def read_data(self, plan: LoadPlan, planner: LoadPlanner) -> Future[None]:

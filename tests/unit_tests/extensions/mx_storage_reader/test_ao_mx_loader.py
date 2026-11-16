@@ -7,7 +7,6 @@ import importlib.util
 import json
 import logging
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -42,41 +41,6 @@ def readers(monkeypatch):
         spec.loader.exec_module(module)
         loaded[name] = module
     return SimpleNamespace(**loaded)
-
-
-@pytest.fixture
-def cpu_npu_boundary(monkeypatch):
-    calls = []
-
-    def anti_quant(qdata, scale, *, axis, dst_type, src_type):
-        calls.append((qdata.shape, scale.shape, axis, dst_type, src_type))
-        if qdata.dtype == torch.uint8:
-            lut = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
-            values = lut[torch.stack((qdata & 15, qdata >> 4), dim=-1).long()].flatten(-2)
-        else:
-            values = qdata.float()
-        scales = torch.exp2(scale.flatten(-2).float() - 127).repeat_interleave(32, -1)
-        return values * scales[..., : values.shape[-1]]
-
-    event = SimpleNamespace(record=lambda stream: None, synchronize=lambda: None)
-    stream = SimpleNamespace(wait_stream=lambda other: None, synchronize=lambda: None)
-    device_module = SimpleNamespace(
-        Stream=lambda **kw: stream,
-        Event=lambda: event,
-        current_stream=lambda device: stream,
-        stream=lambda stream: nullcontext(),
-    )
-    monkeypatch.setattr(torch, "get_device_module", lambda device: device_module)
-    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda self: self)
-    monkeypatch.setitem(
-        sys.modules,
-        "torch_npu",
-        SimpleNamespace(
-            float4_e2m1fn_x2=object(),
-            npu_anti_mx_quant=anti_quant,
-        ),
-    )
-    return calls
 
 
 def _mx_entry(

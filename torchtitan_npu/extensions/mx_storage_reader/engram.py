@@ -99,6 +99,14 @@ class EngramHuggingFaceStorageReader(SafetensorsReaderMixin, QuantizedHuggingFac
                 f"The upstream HF reader does not support the quantization format of {name}; "
                 "convert non-Engram weights to a supported HF format first."
             )
+        # An orphan F8 weight with no scale pair would copy raw codes into the
+        # float target as garbage; only mapped MX pairs may fall through.
+        dtype = f.get_slice(name).get_dtype()
+        if dtype in ("F8_E4M3", "F8_E5M2", "F8_E8M0") and name not in self._weight_scale_mapping:
+            raise ValueError(
+                f"Quantized tensor {name} stored as {dtype} has no MX .scale coverage; refusing to load "
+                "raw quantized codes as plain values"
+            )
         return super()._process_read_request(f, req, planner)
 
     def _read_quantized_tensor_with_block_alignment(self, req, safetensor_file):

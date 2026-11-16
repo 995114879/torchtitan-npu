@@ -23,6 +23,7 @@ from torch.distributed.tensor import DTensor
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 
 from torchtitan_npu.extensions.mx_storage_reader.engram import EngramHuggingFaceStorageReader, dequantize_engram_weight
+from torchtitan_npu.extensions.mx_storage_reader.official_hf_storage import OfficialMxHuggingFaceStorageReader
 
 from .engram.checkpoint import checkpoint_shard
 from .indexer import REUSE
@@ -143,13 +144,39 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
             result.update(self._vision_adapter.from_hf(vision_hf))
         return result
 
+    def _expert_prefix_shapes(self) -> dict[str, tuple[int, ...]]:
+        """HF shapes of aggregated router tensors, at the model's expert count.
+
+        Per-expert tensors subset by name; the router gate lives in one tensor
+        holding all routed experts, so a shrunken model loads its leading rows.
+        """
+        dim = self.model_config.dim  # pyrefly: ignore [missing-attribute]
+        shapes: dict[str, tuple[int, ...]] = {}
+        for i, layer in enumerate(self.model_config.layers):  # pyrefly: ignore [missing-attribute]
+            if layer.moe is None:
+                continue
+            num_experts = layer.moe.num_experts
+            shapes[f"layers.{i}.ffn.gate.bias"] = (num_experts,)
+            shapes[f"layers.{i}.ffn.gate.weight"] = (num_experts, dim)
+        return shapes
+
+    def _engram_table_shapes(self) -> dict[str, tuple[int, int]]:
+        return {
+            f"layers.{i}.engram.embed.weight": (sum(config.head_vocab_sizes), config.embedding_dim)
+            for i, config in self._engram_tables.items()
+        }
+
     def get_hf_storage_reader(self, path: str, from_quantized: bool = False):
+        if from_quantized:
+            # Engram-less models pass no table shapes: the official Engram tensors
+            # stay in the metadata but the target never requests them, so they go unread.
+            return OfficialMxHuggingFaceStorageReader(
+                path,
+                table_shapes=self._engram_table_shapes(),
+                expert_prefix_shapes=self._expert_prefix_shapes(),
+            )
         if self._engram_tables:
-            shapes = {
-                f"layers.{i}.engram.embed.weight": (sum(config.head_vocab_sizes), config.embedding_dim)
-                for i, config in self._engram_tables.items()
-            }
-            return EngramHuggingFaceStorageReader(path, table_shapes=shapes, from_quantized=from_quantized)
+            return EngramHuggingFaceStorageReader(path, table_shapes=self._engram_table_shapes(), from_quantized=False)
         return super().get_hf_storage_reader(path, from_quantized)
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
