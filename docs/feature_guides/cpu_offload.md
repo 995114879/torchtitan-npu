@@ -57,12 +57,24 @@ CPU Offload 是一套"CPU 常驻 + NPU 计算"的显存优化方案：
 │   ├── 安装 grad_accum.install() + grad_clip.install()（显式、幂等）
 │   ├── clip: NPU 侧范数计算 + 系数发布 → 优化器直接消费已缓存的 NPU 梯度
 │   └── optimizer: CpuOffloadAdamW / CpuOffloadDistributedMuon
-│       ├── 状态 CPU 常驻: 每 step CPU 参数/状态 H2D → NPU ping-pong buffer → 计算 → D2H 回 CPU
+│       ├── 状态 CPU 常驻: 每 step CPU 参数/状态 H2D → 有界 batch work buffer → 计算 → D2H 回 CPU
 │       └── 状态 NPU 常驻: 仅 CPU 参数 H2D，状态在 NPU 原地更新，D2H 仅回写参数
 │
 └── TrainerEx → cpu_dtensor_init.install()
     └── init_weights 时 CPU DTensor 参数在 NPU 上初始化后拷回
 ```
+
+## 批量传输与显存上界
+
+`CpuStaging` 提供 `submit_h2d_batch` 和 `submit_d2h_batch`。同一批次会按 dtype、设备和存储兼容性拆分 copy group，每个 group 使用一次 `torch._foreach_copy_` 和一个完成 event；pageable CPU tensor 仍通过 pinned bounce buffer 完成异步传输。调用 `wait()` 会等待批次 event 并释放 bounce buffer。
+
+优化器路径按以下方式使用批量传输：
+
+- AdamW 将有梯度的参数组织成多个有界子 batch。每个子 batch 完成参数、梯度和 CPU optimizer state 的 H2D、NPU 更新与 D2H 后再处理下一个子 batch，work buffer 总量受内部字节阈值限制。clip 已缓存的 NPU gradient 会直接复用，不会再次申请梯度 work buffer。
+- Muon 按 FlexShard bucket 预取权重和 momentum。权重预取使用独立的准备 lane，参数和 momentum 的 D2H 在 step 尾部按 dtype 和 producer stream 合并提交。
+- 梯度累积按 dtype 分组，并继续按 `_CHUNK_BYTES = 64 MiB` 切分。批量路径不会因为 reduce group 较大而申请整组大小的 NPU slab。
+
+cached clip 模式会让工作梯度在 NPU 上保持到 optimizer 消费完成，因此峰值显存仍与全部参与 clip 的梯度规模相关；AdamW 和梯度累积的临时工作区则分别受子 batch 和 64 MiB chunk 限制。
 
 ## 组件清单
 
@@ -92,7 +104,7 @@ CPU Offload 是一套"CPU 常驻 + NPU 计算"的显存优化方案：
 
 **cached clip 模式**（默认，有 consumer 时）：clip 时全量梯度 H2D 一次，NPU 上算范数后**驻留**，优化器直接消费——每个梯度每 step 只 H2D 一次，代价是 NPU 峰值显存 `O(全部梯度)`。
 
-关键性质：offload 后 NPU 占用（梯度 + buffer）**严格低于**非 offload 基线（梯度 + 参数 + 优化器状态），因此不存在"比不 offload 更早 OOM"的场景。
+AdamW 和梯度累积的临时工作区使用有界子 batch 和 64 MiB chunk；cached clip 的工作梯度仍按参与 clip 的梯度总量增长，实际可用显存需要结合模型规模和 clip 配置评估。
 
 **bounded fallback**（无 consumer 时自动退化）：64MB 分块算范数，NPU 峰值 `O(64MB)` 常数，代价是梯度 H2D 两次（clip 一次 + 优化器一次）。实测性能下降明显（全量梯度二次 H2D 为每步秒级），故未暴露为用户选项；如未来超大模型确有需求，可低成本启用。
 

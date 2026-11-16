@@ -19,9 +19,7 @@ from torchtitan_npu.extensions.cpu_offload.cpu_offload_adamw import CpuOffloadAd
 from torchtitan_npu.extensions.cpu_offload.staging import CpuStaging
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
-requires_npu = pytest.mark.skipif(
-    not torch_npu.npu.is_available(), reason="NPU not available"
-)
+requires_npu = pytest.mark.skipif(not torch_npu.npu.is_available(), reason="NPU not available")
 
 
 def _muon_factory_kwargs(*, enable_hsdp_replica_dedup: bool) -> dict[str, object]:
@@ -67,7 +65,14 @@ def test_cpu_offload_muon_factory_consumes_disabled_replica_dedup(monkeypatch) -
     monkeypatch.setattr(cpu_offload_muon, "CpuOffloadDistributedMuon", FakeMuon)
     monkeypatch.setattr(cpu_offload_muon, "LocalPrefetchRuntime", FakeLocalPrefetchRuntime)
 
-    staging = type("FakeStaging", (), {"stream": object()})()
+    local_stream = object()
+
+    def create_stream(*, device):
+        captured["stream_device"] = device
+        return local_stream
+
+    monkeypatch.setattr(cpu_offload_muon.torch_npu.npu, "Stream", create_stream)
+    staging = type("FakeStaging", (), {"stream": object(), "device": torch.device("npu:2")})()
     optimizer = cpu_offload_muon.build_cpu_offload_distributed_muon(
         [],
         staging=staging,
@@ -77,6 +82,9 @@ def test_cpu_offload_muon_factory_consumes_disabled_replica_dedup(monkeypatch) -
 
     assert isinstance(optimizer, FakeMuon)
     assert "enable_hsdp_replica_dedup" not in captured
+    assert captured["stream_device"] == torch.device("npu:2")
+    assert captured["local_stream"] is local_stream
+    assert captured["local_stream"] is not staging.stream
 
 
 def test_cpu_offload_muon_factory_rejects_enabled_replica_dedup() -> None:
@@ -93,9 +101,7 @@ def test_cpu_offload_muon_factory_rejects_enabled_replica_dedup() -> None:
         )
 
 
-def _step_sequence(
-    offload_states: bool, grads: list[torch.Tensor]
-) -> tuple[torch.Tensor, torch.Tensor, set[int], str]:
+def _step_sequence(offload_states: bool, grads: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, set[int], str]:
     torch.manual_seed(0)
     parameter = torch.nn.Parameter(torch.randn(4, 6))
     device = torch.device("npu", torch_npu.npu.current_device())
@@ -204,8 +210,13 @@ def test_adamw_restore_continues_on_compute_device() -> None:
         parameter = torch.nn.Parameter(torch.randn(4, 6))
         staging = CpuStaging(device, owner="test-restore")
         optimizer = CpuOffloadAdamW(
-            [parameter], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
-            staging=staging, offload_states=False,
+            [parameter],
+            lr=1e-2,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=0.1,
+            staging=staging,
+            offload_states=False,
         )
         return optimizer, parameter
 
@@ -288,9 +299,7 @@ def test_muon_checkpoint_roundtrip_steps_on_compute_device() -> None:
         return build_cpu_offload_distributed_muon(
             [{"params": [parameter], "param_names": ["weight"]}],
             staging=staging,
-            compute_sharding_by_fqn={
-                "weight": ComputeLayout(shardings_by_mesh_axis={"dp_shard": Owned()})
-            },
+            compute_sharding_by_fqn={"weight": ComputeLayout(shardings_by_mesh_axis={"dp_shard": Owned()})},
             bucket_configs=[BucketConfig(patterns=("weight",), name="test")],
             offload_states=False,
             lr=1e-2,

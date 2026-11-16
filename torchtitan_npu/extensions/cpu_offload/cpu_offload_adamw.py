@@ -15,11 +15,13 @@ import torch
 import torch_npu
 from torch import Tensor
 
+_BATCH_BYTES = 64 * 1024 * 1024
+
+
 from torchtitan_npu.extensions.cpu_offload.runtime import (
     GradientClipChannel,
     local_tensor,
     require_cpu_tensor,
-    stage_gradient,
 )
 
 if TYPE_CHECKING:
@@ -34,7 +36,14 @@ class _AdamWWork:
     gradient: Tensor
     exp_avg: Tensor
     exp_avg_sq: Tensor
+
+
+@dataclass(slots=True)
+class _AdamWBatchWork:
+    entries: tuple[_AdamWEntry, ...]
+    works: tuple[_AdamWWork, ...]
     h2d: tuple[Any, ...] = ()
+    buffer_keys: tuple[tuple[int, int, int, torch.dtype], ...] = ()
 
 
 @dataclass(slots=True)
@@ -81,6 +90,7 @@ class CpuOffloadAdamW(torch.optim.AdamW):
         self._offload_states = offload_states
         self._compute_device = staging.device  # pyrefly: ignore [read-only]
         self._work_buffers: dict[tuple[int, int, torch.dtype], Tensor] = {}
+        self._batch_work_buffers: dict[tuple[int, int, int, torch.dtype], Tensor] = {}
         super().__init__(
             params,
             lr=lr,
@@ -174,139 +184,169 @@ class CpuOffloadAdamW(torch.optim.AdamW):
 
                 entries.append(_AdamWEntry(parameter, group, state, canonical))
 
-        pending_work: _AdamWWork | None = None
-        for index, entry in enumerate(entries):
-            work = self._enqueue_work(index % 2, entry) if pending_work is None else pending_work
-            next_work = self._enqueue_work((index + 1) % 2, entries[index + 1]) if index + 1 < len(entries) else None
-
-            for handle in work.h2d:
-                handle.wait_on(compute_stream)
-
-            with torch_npu.npu.stream(compute_stream):
-                # Standard AdamW update with public ops only, mirroring
-                # torch.optim._functional._single_tensor_adamw for the
-                # supported option subset (no foreach/fused/amsgrad/
-                # capturable/differentiable; complex tensors are rejected
-                # earlier; maximize is honored).
-                gradient = -work.gradient if entry.group["maximize"] else work.gradient
-                lr = entry.group["lr"]
-                beta1, beta2 = entry.group["betas"]
-                weight_decay = entry.group["weight_decay"]
-                eps = entry.group["eps"]
-
-                entry.state["step"] += 1
-                step = int(entry.state["step"].item())
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                step_size = lr / bias_correction1
-                bias_correction2_sqrt = math.sqrt(bias_correction2)
-
-                if weight_decay != 0:
-                    work.parameter.mul_(1 - lr * weight_decay)
-                work.exp_avg.lerp_(gradient, 1 - beta1)
-                work.exp_avg_sq.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
-                denom = (work.exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-                work.parameter.addcdiv_(work.exp_avg, denom, value=-step_size)
-            if work.gradient.device.type == "npu":
-                work.gradient.record_stream(compute_stream)
-            self._staging.submit_d2h(
-                work.parameter,
-                entry.canonical[0],
-                producer_stream=compute_stream,
-                stream=transfer_stream,
-            )
-            if self._offload_states:
-                self._staging.submit_d2h(
-                    work.exp_avg,
-                    entry.canonical[2],
-                    producer_stream=compute_stream,
-                    stream=transfer_stream,
-                )
-                self._staging.submit_d2h(
-                    work.exp_avg_sq,
-                    entry.canonical[3],
-                    producer_stream=compute_stream,
-                    stream=transfer_stream,
-                )
-            torch.autograd.graph.increment_version(entry.parameter)
-            pending_work = next_work
+        if entries:
+            # Keep each batch bounded so CPU offload does not turn into a
+            # full-optimizer NPU allocation. Dtype grouping still happens
+            # inside each batch.
+            for batch_entries in self._iter_entry_batches(tuple(entries)):
+                current = self._enqueue_batch(0, batch_entries, compute_stream)
+                for handle in current.h2d:
+                    handle.wait_on(compute_stream)
+                with torch_npu.npu.stream(compute_stream):
+                    for entry, work in zip(current.entries, current.works, strict=True):
+                        if self._clip_channel is not None:
+                            self._clip_channel.apply_pending(work.gradient)
+                        self._update_one(entry, work)
+                        for tensor in (work.parameter, work.gradient, work.exp_avg, work.exp_avg_sq):
+                            tensor.record_stream(compute_stream)
+                        torch.autograd.graph.increment_version(entry.parameter)
+                self._submit_batch_d2h(current, compute_stream, transfer_stream)
         self._staging.wait()
         return loss
 
-    def _ensure_work_buffer(self, slot: int, kind: int, numel: int, dtype: torch.dtype) -> Tensor:
-        """Return the (slot, kind, dtype) work buffer, growing it if needed.
-
-        Growth waits for in-flight staging transfers first so that the
-        pre-warm below never pays a mid-pipeline stall.
-        """
-        key = (slot, kind, dtype)
-        buffer = self._work_buffers.get(key)
-        if buffer is None or buffer.numel() < numel:
-            if buffer is not None:
-                self._staging.wait()
-            buffer = torch.empty(
-                numel,
-                dtype=dtype,
-                device=self._compute_device,
+    def _iter_entry_batches(self, entries: tuple[_AdamWEntry, ...]) -> Iterable[tuple[_AdamWEntry, ...]]:
+        batch: list[_AdamWEntry] = []
+        batch_bytes = 0
+        for entry in entries:
+            entry_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in entry.canonical
+                if self._offload_states or tensor is entry.canonical[0] or tensor is entry.canonical[1]
             )
-            self._work_buffers[key] = buffer
-        return buffer
+            if batch and batch_bytes + entry_bytes > _BATCH_BYTES:
+                yield tuple(batch)
+                batch = []
+                batch_bytes = 0
+            batch.append(entry)
+            batch_bytes += entry_bytes
+        if batch:
+            yield tuple(batch)
+
+    @staticmethod
+    def _copy_groups(sources: list[Tensor], destinations: list[Tensor]) -> list[tuple[list[Tensor], list[Tensor]]]:
+        groups: dict[
+            tuple[torch.dtype, torch.dtype, torch.device, torch.device],
+            tuple[list[Tensor], list[Tensor]],
+        ] = {}
+        for source, destination in zip(sources, destinations, strict=True):
+            key = (source.dtype, destination.dtype, source.device, destination.device)
+            group = groups.setdefault(key, ([], []))
+            group[0].append(source)
+            group[1].append(destination)
+        return list(groups.values())
+
+    def _enqueue_batch(
+        self,
+        slot: int,
+        entries: tuple[_AdamWEntry, ...],
+        compute_stream: Any,
+    ) -> _AdamWBatchWork:
+        works: list[_AdamWWork] = []
+        h2d_sources: list[Tensor] = []
+        h2d_destinations: list[Tensor] = []
+        buffer_keys: set[tuple[int, int, int, torch.dtype]] = set()
+        for entry in entries:
+            parameter, gradient, exp_avg, exp_avg_sq = entry.canonical
+            cached_gradient = (
+                self._clip_channel.take_gradient(entry.parameter, gradient) if self._clip_channel is not None else None
+            )
+            if cached_gradient is not None:
+                working_gradient = cached_gradient.view_as(gradient)
+                if working_gradient.device.type == "npu":
+                    working_gradient.record_stream(compute_stream)
+            else:
+                working_gradient = self._batch_work_buffer(slot, 1, gradient)
+                buffer_keys.add((slot, 1, id(gradient), gradient.dtype))
+                h2d_sources.append(gradient)
+                h2d_destinations.append(working_gradient)
+            sources = [parameter]
+            destinations = [self._batch_work_buffer(slot, 0, parameter)]
+            buffer_keys.add((slot, 0, id(parameter), parameter.dtype))
+            if self._offload_states:
+                sources.extend((exp_avg, exp_avg_sq))
+                destinations.extend(
+                    (
+                        self._batch_work_buffer(slot, 2, exp_avg),
+                        self._batch_work_buffer(slot, 3, exp_avg_sq),
+                    )
+                )
+                buffer_keys.add((slot, 2, id(exp_avg), exp_avg.dtype))
+                buffer_keys.add((slot, 3, id(exp_avg_sq), exp_avg_sq.dtype))
+            h2d_sources.extend(sources)
+            h2d_destinations.extend(destinations)
+            works.append(
+                _AdamWWork(
+                    destinations[0],
+                    working_gradient,
+                    destinations[1] if self._offload_states else exp_avg,
+                    destinations[2] if self._offload_states else exp_avg_sq,
+                )
+            )
+        handles = tuple(
+            self._staging.submit_h2d_batch(group_sources, group_destinations, stream=self._staging.stream)
+            for group_sources, group_destinations in self._copy_groups(h2d_sources, h2d_destinations)
+        )
+        return _AdamWBatchWork(entries, tuple(works), handles, tuple(buffer_keys))
+
+    @staticmethod
+    def _update_one(entry: _AdamWEntry, work: _AdamWWork) -> None:
+        gradient = -work.gradient if entry.group["maximize"] else work.gradient
+        lr = entry.group["lr"]
+        beta1, beta2 = entry.group["betas"]
+        weight_decay = entry.group["weight_decay"]
+        eps = entry.group["eps"]
+        entry.state["step"] += 1
+        step = int(entry.state["step"].item())
+        bias_correction1 = 1 - beta1**step
+        bias_correction2 = 1 - beta2**step
+        step_size = lr / bias_correction1
+        bias_correction2_sqrt = math.sqrt(bias_correction2)
+        if weight_decay != 0:
+            work.parameter.mul_(1 - lr * weight_decay)
+        work.exp_avg.lerp_(gradient, 1 - beta1)
+        work.exp_avg_sq.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
+        denom = (work.exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+        work.parameter.addcdiv_(work.exp_avg, denom, value=-step_size)
+
+    def _submit_batch_d2h(
+        self,
+        batch: _AdamWBatchWork,
+        compute_stream: Any,
+        transfer_stream: Any,
+    ) -> None:
+        sources: list[Tensor] = []
+        destinations: list[Tensor] = []
+        for entry, work in zip(batch.entries, batch.works, strict=True):
+            sources.append(work.parameter)
+            destinations.append(entry.canonical[0])
+            if self._offload_states:
+                sources.extend((work.exp_avg, work.exp_avg_sq))
+                destinations.extend((entry.canonical[2], entry.canonical[3]))
+        for group_sources, group_destinations in self._copy_groups(sources, destinations):
+            self._staging.submit_d2h_batch(
+                group_sources,
+                group_destinations,
+                producer_stream=compute_stream,
+                stream=transfer_stream,
+            )
+        # Staging records the transfer stream on the working tensors, so
+        # dropping the cache cannot recycle storage before D2H completes.
+        for key in batch.buffer_keys:
+            self._batch_work_buffers.pop(key, None)
 
     def _reserve_work_buffers(self) -> None:
-        """Pre-warm both slots for every tensor class before the pipelined loop."""
-        for group in self.param_groups:
-            for parameter in group["params"]:
-                state = self.state.get(parameter, {})
-                parameter_local = local_tensor(parameter)
-                tensors = [
-                    (0, parameter_local),
-                    (1, parameter_local),  # gradients share the parameter spec
-                ]
-                if self._offload_states:
-                    tensors += [
-                        (2, local_tensor(state["exp_avg"])),
-                        (3, local_tensor(state["exp_avg_sq"])),
-                    ]
-                for kind, local in tensors:
-                    for slot in range(2):
-                        self._ensure_work_buffer(slot, kind, local.numel(), local.dtype)
+        """Keep allocation lazy; each batch owns only its active slot."""
+        self._batch_work_buffers.clear()
 
-    def _work_buffer(self, slot: int, kind: int, tensor: Tensor) -> Tensor:
-        buffer = self._ensure_work_buffer(slot, kind, tensor.numel(), tensor.dtype)
+    def _batch_work_buffer(self, slot: int, kind: int, tensor: Tensor) -> Tensor:
+        key = (slot, kind, id(tensor), tensor.dtype)
+        buffer = self._batch_work_buffers.get(key)
+        if buffer is None or buffer.numel() < tensor.numel():
+            buffer = torch.empty(tensor.numel(), dtype=tensor.dtype, device=self._compute_device)
+            self._batch_work_buffers[key] = buffer
+        # Keep the legacy per-slot view populated for diagnostics and older
+        # callers that inspect the optimizer's staged planes.  The batched
+        # path itself is keyed by tensor id and drops entries after D2H, so
+        # this compatibility map retains only the latest buffer per plane.
+        self._work_buffers[(slot, kind, tensor.dtype)] = buffer
         return buffer[: tensor.numel()].view(tensor.shape)
-
-    def _enqueue_work(self, slot: int, entry: _AdamWEntry) -> _AdamWWork:
-        parameter, gradient, exp_avg, exp_avg_sq = entry.canonical
-
-        def gradient_destination():
-            return self._work_buffer(slot, 1, gradient)
-
-        working_gradient, gradient_handles = stage_gradient(
-            entry.parameter,
-            gradient,
-            gradient_destination,
-            staging=self._staging,
-            channel=self._clip_channel,
-            stream=self._staging.stream,
-        )
-        sources = [(0, parameter)]
-        if self._offload_states:
-            sources += [(2, exp_avg), (3, exp_avg_sq)]
-        buffers = {kind: self._work_buffer(slot, kind, source) for kind, source in sources}
-        handles = tuple(
-            self._staging.submit_h2d(
-                source,
-                buffers[kind],
-                stream=self._staging.stream,
-            )
-            for kind, source in sources
-        )
-        # NPU-resident state updates in place on the compute device and never
-        # round-trips through work buffers.
-        return _AdamWWork(
-            buffers[0],
-            working_gradient,
-            buffers.get(2, exp_avg),
-            buffers.get(3, exp_avg_sq),
-            h2d=(*gradient_handles, *handles),
-        )

@@ -70,6 +70,14 @@ class _CommunicationEvents:
 
 
 @dataclass(slots=True)
+class _WeightPrefetchBucket:
+    """One optimizer bucket's batched weight H2D lifecycle."""
+
+    layouts: tuple[Any, ...]
+    ready_event: Any | None = None
+
+
+@dataclass(slots=True)
 class _LocalWork[ItemT]:
     item: ItemT
     buffer: Tensor
@@ -122,9 +130,18 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
     ) -> None:
         super().__init__(device)
         self._local_stream = local_stream
+        # Input preparation must not queue behind local item finalization,
+        # which waits for the current bucket's compute. This lane performs
+        # device-side preparation only; host transfers use staging.stream.
+        self._prep_stream = torch_npu.npu.Stream(device=device)
         self._local_slots: tuple[_LocalSlot, ...] = ()
         self._communication_events: dict[int, _CommunicationEvents] = {}
         self._event_context_id: int | None = None
+        # The public enqueue helpers retain their upstream immediate-prefetch
+        # behavior.  The bucketed ``run`` path enables deferral so that the
+        # next bucket's gradient input is submitted before the current
+        # bucket's weight H2D on the single staging stream.
+        self._defer_parameter_prefetch_enabled = False
 
     @classmethod
     def from_runtime(
@@ -176,6 +193,33 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
     ) -> Sequence[ItemT]:
         return plan.items if isinstance(plan, _LocalBucketPlan) else plan.unredistributed_items
 
+    @staticmethod
+    def _prefetch_owner(callback: Any) -> Any | None:
+        owner = getattr(callback, "__self__", None)
+        return owner if hasattr(owner, "_prefetch_parameters") else None
+
+    def _defer_parameter_prefetch(self, callback: Any, items: Sequence[ItemT]) -> bool:
+        """Defer weight H2D when the optimizer provides the staging queue."""
+        owner = self._prefetch_owner(callback)
+        if owner is None or not hasattr(owner, "_defer_parameter_prefetch"):
+            return False
+        owner._defer_parameter_prefetch(items)
+        return True
+
+    def _flush_deferred_parameter_prefetch(self, callback: Any) -> None:
+        owner = self._prefetch_owner(callback)
+        if owner is not None and hasattr(owner, "_flush_deferred_parameter_prefetch"):
+            owner._flush_deferred_parameter_prefetch()
+
+    def _should_defer_parameter_prefetch(self, callback: Any) -> bool:
+        if not getattr(self, "_defer_parameter_prefetch_enabled", False):
+            return False
+        owner = self._prefetch_owner(callback)
+        if owner is None or not hasattr(owner, "_defer_parameter_prefetch"):
+            return False
+        policy = getattr(owner, "_should_defer_parameter_prefetch", None)
+        return policy is None or bool(policy())
+
     def reserve_buffers(
         self,
         plans: Sequence[_LocalBucketPlan[ItemT] | _RedistributionBucketPlan[ItemT]],
@@ -223,6 +267,8 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
                 transfer_stream=local_stream,
             )
             slot.buffers.record_compute_stream(local_stream)
+        for slot in context.slots:
+            slot.buffers.record_compute_stream(self._prep_stream)
 
     def _enqueue_local(
         self,
@@ -243,6 +289,13 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
             buffer = slot.buffers.compute_buffer(shape, dtype=dtype, device=device)
             prepare(item, buffer)
             slot.events.input_ready.record(local_stream)
+            prefetch = getattr(getattr(prepare, "__self__", None), "_prefetch_parameters", None)
+            if prefetch is not None:
+                if self._should_defer_parameter_prefetch(prepare):
+                    self._flush_deferred_parameter_prefetch(prepare)
+                    self._defer_parameter_prefetch(prepare, (item,))
+                else:
+                    prefetch((item,), stream=local_stream)
         return _LocalWork(item, buffer, slot.events)
 
     @staticmethod
@@ -269,6 +322,7 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
         local_stream = self._local_stream or context.transfer_stream
         with handle.stream(local_stream):
             local_stream.wait_event(work.events.compute_done)
+            self._flush_deferred_parameter_prefetch(finalize)
             finalize(work.item, work.buffer)
             work.events.done.record(local_stream)
 
@@ -314,6 +368,9 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
             ),
             release=lambda work: self._release_local(work, caller),
         )
+        flush = getattr(getattr(finalize, "__self__", None), "_flush_parameter_d2h", None)
+        if flush is not None:
+            flush()
 
     def _compute_without_redistribution(
         self,
@@ -396,12 +453,18 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
         prepare: Callable[[ItemT, Tensor], None],
     ) -> _BucketWork[ItemT]:
         handle = context.device_handle
-        storage_stream = self._local_stream or context.transfer_stream
+        storage_stream = self._prep_stream
         communication_stream = context.transfer_stream
         events = self._communication_events_for(slot)
         with handle.stream(storage_stream):
+            # The previous occupant finalized on the local stream. Keep
+            # that reuse fence, without joining the current bucket's tail.
+            storage_stream.wait_event(slot.done)
             storage_buffer, compute_buffer = slot.buffers.communication_buffers(plan)
             work = _BucketWork(plan, slot, storage_buffer, compute_buffer)
+            prefetch_momenta = getattr(getattr(prepare, "__self__", None), "_prefetch_bucket_momenta", None)
+            if prefetch_momenta is not None:
+                prefetch_momenta(plan.redistributed_items, stream=storage_stream)
             _prepare_redistributed(
                 plan,
                 slot.buffers,
@@ -417,6 +480,17 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
                 input=storage_buffer,
             )
             slot.compute_input_ready.record(communication_stream)
+        # Weight copies are deliberately delayed until this bucket's input
+        # H2D and all-to-all have been submitted.  Flush the previous bucket's
+        # deferred weights first, then defer this bucket's weights so the next
+        # bucket's gradient H2D gets priority on the single staging stream.
+        prefetch = getattr(getattr(prepare, "__self__", None), "_prefetch_parameters", None)
+        if prefetch is not None:
+            if self._should_defer_parameter_prefetch(prepare):
+                self._flush_deferred_parameter_prefetch(prepare)
+                self._defer_parameter_prefetch(prepare, plan.redistributed_items)
+            else:
+                prefetch(plan.redistributed_items, stream=storage_stream)
         return work
 
     def _enqueue_compute_to_storage(
@@ -440,11 +514,15 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
             events.reverse_ready.record(communication_stream)
         with handle.stream(storage_stream):
             storage_stream.wait_event(events.reverse_ready)
+            self._flush_deferred_parameter_prefetch(finalize)
             _finalize_redistributed(
                 work,
                 work.slot.buffers,
                 finalize=finalize,
             )
+            flush = getattr(getattr(finalize, "__self__", None), "_flush_parameter_d2h", None)
+            if flush is not None:
+                flush()
             work.slot.done.record(storage_stream)
 
     def run(
@@ -466,6 +544,8 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
         caller = handle.current_stream(self._device)
         local_stream = self._local_stream or context.transfer_stream
         local_stream.wait_stream(caller)
+        self._prep_stream.wait_stream(caller)
+        self._defer_parameter_prefetch_enabled = True
         try:
             super().run(
                 plans,
@@ -476,8 +556,12 @@ class LocalPrefetchRuntime[ItemT](_BucketedRedistributionRuntime[ItemT]):
             )
         except BaseException:
             local_stream.wait_stream(caller)
+            self._prep_stream.wait_stream(caller)
             caller.wait_stream(local_stream)
+            caller.wait_stream(self._prep_stream)
             raise
+        finally:
+            self._defer_parameter_prefetch_enabled = False
 
 
 class CpuOffloadDistributedMuon(DistMuon):
@@ -500,6 +584,14 @@ class CpuOffloadDistributedMuon(DistMuon):
         self._scratch_by_slot: dict[tuple[int, str, torch.dtype], torch.Tensor] = {}
         self._scratch_releases: dict[int, TransferHandle] = {}
         self._retired_scratch: list[torch.Tensor] = []
+        # Prepared parameter/momentum work is kept by logical parameter until
+        # finalize.  This lets the next bucket H2D its weights before the
+        # current bucket finishes Muon, while one bucket-level foreach D2H
+        # commits all completed updates together.
+        self._prefetched_parameters: dict[int, tuple[torch.Tensor, _WeightPrefetchBucket]] = {}
+        self._prefetched_momenta: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._pending_parameter_prefetch: list[_WeightPrefetchBucket] = []
+        self._pending_d2h: list[tuple[torch.Tensor, torch.Tensor, Any]] = []
         super().__init__(params, **kwargs)
 
     def _validate_parameter_storage(self) -> torch.device:
@@ -564,6 +656,42 @@ class CpuOffloadDistributedMuon(DistMuon):
         self._scratch_by_slot.clear()
         self._scratch_releases.clear()
         self._retired_scratch.clear()
+        self._prefetched_parameters.clear()
+        self._prefetched_momenta.clear()
+        self._pending_parameter_prefetch.clear()
+        self._pending_d2h.clear()
+
+    def _should_defer_parameter_prefetch(self) -> bool:
+        """Defer weights only when the next input has a staging H2D.
+
+        With NPU-resident optimizer state, the clip channel supplies the
+        already staged NPU gradient and momentum never leaves the device.
+        There is then no next-bucket optimizer H2D for a weight copy to block,
+        so delaying weights only moves useful prefetch work later.
+        """
+        if self._offload_states or self._clip_channel is None:
+            return True
+        return getattr(self._clip_channel, "_pending", None) is None
+
+    def _defer_parameter_prefetch(
+        self,
+        compute_layouts: Sequence[_ParameterComputeLayout],
+    ) -> None:
+        """Queue a bucket's weight copy after the next input batch is queued.
+
+        Gradient and momentum H2D copies are on the critical path to the next
+        redistribution all-to-all.  We therefore keep weight copies out of
+        the staging stream until the following bucket has submitted its
+        input copies.  The caller owns the small pending queue and flushes
+        the previous bucket immediately before enqueuing the next one.
+        """
+        self._pending_parameter_prefetch.append(_WeightPrefetchBucket(tuple(compute_layouts)))
+
+    def _flush_deferred_parameter_prefetch(self) -> None:
+        if not self._pending_parameter_prefetch:
+            return
+        bucket = self._pending_parameter_prefetch.pop(0)
+        self._prefetch_parameters(bucket.layouts, stream=self._staging.stream, bucket=bucket)
 
     def _local_tensor_spec(
         self,
@@ -579,7 +707,9 @@ class CpuOffloadDistributedMuon(DistMuon):
         owner: torch.Tensor,
         kind: str,
     ) -> torch.Tensor:
-        key = (owner.untyped_storage().data_ptr(), kind, tensor.dtype)
+        # The owner is the stable logical parameter, not a storage base:
+        # different CPU parameters can be slices of the same pinned slab.
+        key = (id(owner), kind, tensor.dtype)
         scratch = self._scratch_by_slot.get(key)
         if scratch is None or scratch.numel() < tensor.numel():
             if scratch is not None:
@@ -609,10 +739,14 @@ class CpuOffloadDistributedMuon(DistMuon):
 
     @torch.no_grad()
     def step(self, closure: Callable[[], float] | None = None) -> float | None:  # pyrefly: ignore [bad-override]
+        self._staging.stream.wait_stream(torch_npu.npu.current_stream(self._compute_device))
         result = super().step(closure)
+        self._flush_parameter_d2h()
         self._staging.wait()
         self._scratch_releases.clear()
         self._retired_scratch.clear()
+        self._prefetched_parameters.clear()
+        self._prefetched_momenta.clear()
         return result
 
     def load_state_dict(self, state_dict):
@@ -655,13 +789,9 @@ class CpuOffloadDistributedMuon(DistMuon):
             stream=stream,
         )
         if self._offload_states:
-            momentum_work = self._scratch_like(
-                momentum,
-                owner=out,
-                kind="momentum",
-            )
-            self._wait_for_scratch(momentum_work, stream)
-            self._staging.submit_h2d(momentum, momentum_work, stream=stream)
+            if id(compute_layout) not in self._prefetched_momenta:
+                self._prefetch_bucket_momenta((compute_layout,), stream=stream)
+            momentum_work, _ = self._prefetched_momenta[id(compute_layout)]
             _prepare_muon_input(
                 out,
                 momentum_work,
@@ -669,13 +799,7 @@ class CpuOffloadDistributedMuon(DistMuon):
                 nesterov=group["nesterov"],
                 out=out,
             )
-            release = self._staging.submit_d2h(
-                momentum_work,
-                momentum,
-                producer_stream=stream,
-                stream=self._commit_stream,
-            )
-            self._release_scratch(momentum_work, release)
+            self._prefetched_momenta[id(compute_layout)] = (momentum_work, momentum)
         else:
             # NPU-resident momentum: blend in place on the compute device.
             _prepare_muon_input(
@@ -687,6 +811,76 @@ class CpuOffloadDistributedMuon(DistMuon):
             )
         torch.autograd.graph.increment_version(momentum_state)
 
+    def _prefetch_bucket_momenta(
+        self,
+        compute_layouts: Sequence[_ParameterComputeLayout],
+        *,
+        stream: torch.Stream,
+    ) -> None:
+        """Batch the next bucket's CPU momentum before preparing HCCL inputs."""
+        if not self._offload_states:
+            return
+        groups: dict[torch.dtype, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+        h2d_stream = self._staging.stream
+        with torch_npu.npu.stream(h2d_stream):
+            for layout in compute_layouts:
+                _, momentum, _, _ = self._local_gradient_and_momentum(layout)
+                work = self._scratch_like(momentum, owner=layout.param, kind="momentum-prefetch")
+                self._wait_for_scratch(work, h2d_stream)
+                sources, destinations = groups.setdefault(momentum.dtype, ([], []))
+                sources.append(momentum)
+                destinations.append(work)
+                work.record_stream(stream)
+                self._prefetched_momenta[id(layout)] = (work, momentum)
+            for sources, destinations in groups.values():
+                ready = self._staging.submit_h2d_batch(sources, destinations, stream=h2d_stream)
+                ready.wait_on(stream)
+
+    def _prefetch_parameters(
+        self,
+        compute_layouts: Sequence[_ParameterComputeLayout],
+        *,
+        stream: torch.Stream,
+        bucket: _WeightPrefetchBucket | None = None,
+    ) -> None:
+        """Stage one weight bucket and publish one device-side ready event."""
+        layouts = tuple(layout for layout in compute_layouts if id(layout) not in self._prefetched_parameters)
+        if not layouts:
+            return
+        bucket = bucket or _WeightPrefetchBucket(layouts)
+        bucket.layouts = layouts
+        groups: dict[torch.dtype, list[tuple[_ParameterComputeLayout, torch.Tensor, torch.Tensor]]] = {}
+        # Never queue H2D behind a consumer's compute_done/reverse_ready.
+        # All weights and momenta share this one transfer lane.
+        consumer_stream = stream
+        transfer_stream = self._staging.stream
+        with torch_npu.npu.stream(transfer_stream):
+            for compute_layout in layouts:
+                local_param = compute_layout.param.to_local()
+                parameter_work = self._scratch_like(
+                    local_param,
+                    owner=compute_layout.param,
+                    kind="parameter-prefetch",
+                )
+                self._wait_for_scratch(parameter_work, transfer_stream)
+                groups.setdefault(local_param.dtype, []).append((compute_layout, local_param, parameter_work))
+            for group in groups.values():
+                ready = self._staging.submit_h2d_batch(
+                    [source for _layout, source, _work in group],
+                    [work for _layout, _source, work in group],
+                    stream=transfer_stream,
+                )
+                for compute_layout, _source, work in group:
+                    work.record_stream(consumer_stream)
+                    self._prefetched_parameters[id(compute_layout)] = (work, bucket)
+            bucket.ready_event = torch_npu.npu.Event()
+            bucket.ready_event.record(transfer_stream)
+
+    @staticmethod
+    def _wait_for_weight_bucket(bucket: _WeightPrefetchBucket, stream: torch.Stream) -> None:
+        if bucket.ready_event is not None:
+            stream.wait_event(bucket.ready_event)
+
     def _apply_update(
         self,
         compute_layout: _ParameterComputeLayout,
@@ -694,18 +888,19 @@ class CpuOffloadDistributedMuon(DistMuon):
     ) -> None:
         # Current TorchTitan stores the canonical parameter in
         # ``compute_layout.param`` and no longer exposes the old
-        # ``local_storage_view`` field.  CPU-offload always stages that local
-        # canonical tensor to the NPU scratch buffer before updating it.
+        # ``local_storage_view`` field. The runtime stages weights separately
+        # from prepare; direct callback users retain a synchronous-in-stream
+        # fallback without making communication wait for those weights.
         local_param = compute_layout.param.to_local()
         assert local_param is not None
         stream = torch_npu.npu.current_stream(self._compute_device)
-        parameter_work = self._scratch_like(
-            local_param,
-            owner=direction,
-            kind="parameter",
-        )
-        self._wait_for_scratch(parameter_work, stream)
-        self._staging.submit_h2d(local_param, parameter_work, stream=stream)
+        if id(compute_layout) not in self._prefetched_parameters:
+            # Keep a safe fallback for callers that invoke finalize without
+            # the normal runtime prepare path.
+            self._prefetch_parameters((compute_layout,), stream=stream)
+        parameter_work, weight_bucket = self._prefetched_parameters.pop(id(compute_layout))
+        self._wait_for_weight_bucket(weight_bucket, stream)
+        parameter_work.record_stream(stream)
         group = self._group(compute_layout)
         _apply_muon_update(
             parameter_work,
@@ -715,14 +910,34 @@ class CpuOffloadDistributedMuon(DistMuon):
             adjust_lr_fn=group["adjust_lr_fn"],
             compute_matrix_shape=compute_layout.global_compute_shape,
         )
-        release = self._staging.submit_d2h(
-            parameter_work,
-            local_param,
-            producer_stream=stream,
-            stream=self._commit_stream,
-        )
-        self._release_scratch(parameter_work, release)
+        self._pending_d2h.append((parameter_work, local_param, stream))
+        momentum_pair = self._prefetched_momenta.pop(id(compute_layout), None)
+        if momentum_pair is not None:
+            self._pending_d2h.append((momentum_pair[0], momentum_pair[1], stream))
         torch.autograd.graph.increment_version(compute_layout.param)
+
+    def _flush_parameter_d2h(self) -> None:
+        """Commit all finalized parameters/momenta with bucket-level foreach."""
+        if not self._pending_d2h:
+            return
+        groups: dict[
+            tuple[torch.dtype, Any],
+            tuple[Any, list[torch.Tensor], list[torch.Tensor]],
+        ] = {}
+        for source, destination, producer in self._pending_d2h:
+            group = groups.setdefault((source.dtype, producer), (producer, [], []))
+            group[1].append(source)
+            group[2].append(destination)
+        for (_source_dtype, _producer_id), (producer, sources, destinations) in groups.items():
+            handle = self._staging.submit_d2h_batch(
+                sources,
+                destinations,
+                producer_stream=producer,
+                stream=self._commit_stream,
+            )
+            for source in sources:
+                self._release_scratch(source, handle)
+        self._pending_d2h.clear()
 
 
 def build_cpu_offload_distributed_muon(
@@ -749,7 +964,7 @@ def build_cpu_offload_distributed_muon(
     upstream_runtime = optimizer._redistribution_runtime
     optimizer._redistribution_runtime = LocalPrefetchRuntime.from_runtime(
         upstream_runtime,
-        local_stream=staging.stream,
+        local_stream=torch_npu.npu.Stream(device=staging.device),
     )
     optimizer._redistribution_runtime.reserve_buffers(
         optimizer._bucket_plans,

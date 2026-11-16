@@ -223,6 +223,7 @@ def stage_gradient(
     clip-coefficient scaling and the copy-out always run on the caller's
     current stream, so the returned tensor is ready for any op enqueued on
     that stream after waiting the returned handles there.
+
     """
     working = channel.take_gradient(parameter, cpu_gradient) if channel is not None else None
     if callable(destination):
@@ -238,8 +239,15 @@ def stage_gradient(
             working.record_stream(current)
         return destination, ()
 
-    handle = staging.submit_h2d(cpu_gradient, destination, stream=stream)
-    current = torch.get_device_module(destination.device).current_stream(destination.device)
+    device_module = torch.get_device_module(destination.device)
+    current = device_module.current_stream(destination.device)
+    transfer_stream = stream
+    transfer_buffer = destination
+    # A gradient is a single tensor. Keep the single-copy path here; the
+    # foreach batch path is reserved for actual buckets. In particular, do
+    # not turn the common case into an extra NPU allocation plus a device to
+    # device copy merely to route one H2D through the staging stream.
+    handle = staging.submit_h2d(cpu_gradient, transfer_buffer, stream=transfer_stream)
     handle.wait_on(current)
     if channel is not None:
         channel.apply_pending(destination)

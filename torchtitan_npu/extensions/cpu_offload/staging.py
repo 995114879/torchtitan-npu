@@ -87,6 +87,7 @@ class CpuStaging:
         self._bounce_slots = tuple(_BounceSlot() for _ in range(_BOUNCE_SLOT_COUNT))
         self._next_bounce_slot = 0
         self._pending: list[TransferHandle] = []
+        self._batch_bounce_handles: list[TransferHandle] = []
         self._closed = False
 
     @property
@@ -180,6 +181,106 @@ class CpuStaging:
             self._pending.append(handle)
         return handle
 
+    @staticmethod
+    def _validate_batch(
+        sources: list[torch.Tensor] | tuple[torch.Tensor, ...],
+        destinations: list[torch.Tensor] | tuple[torch.Tensor, ...],
+        device: torch.device,
+    ) -> None:
+        if len(sources) != len(destinations):
+            raise ValueError("batched CPU/NPU copies require equal source and destination lengths")
+        for source, destination in zip(sources, destinations, strict=True):
+            CpuStaging._validate_pair(source, destination, device)
+
+    @staticmethod
+    def _free_bounces(bounces: list[tuple[torch.Tensor, torch.Tensor]], owner: str) -> None:
+        for raw, _view in bounces:
+            PinnedCpuStorage.free(raw, owner=owner)
+
+    def _allocate_batch_bounces(
+        self,
+        tensors: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        # Bound pageable batches too; unlike pinned canonical tensors they
+        # require host allocations that cannot be recycled by record_stream.
+        if len(self._batch_bounce_handles) >= _BOUNCE_SLOT_COUNT:
+            self._batch_bounce_handles.pop(0).wait()
+        bounces: list[tuple[torch.Tensor, torch.Tensor]] = []
+        try:
+            for tensor in tensors:
+                raw = PinnedCpuStorage.allocate(
+                    tensor.numel() * tensor.element_size(),
+                    owner=self.owner,
+                )
+                view = raw[: tensor.numel() * tensor.element_size()].view(tensor.dtype).view(tensor.shape)
+                bounces.append((raw, view))
+            return bounces
+        except Exception:
+            self._free_bounces(bounces, self.owner)
+            raise
+
+    def submit_h2d_batch(
+        self,
+        sources: list[torch.Tensor] | tuple[torch.Tensor, ...],
+        destinations: list[torch.Tensor] | tuple[torch.Tensor, ...],
+        *,
+        stream: Any | None = None,
+        track: bool = True,
+    ) -> TransferHandle:
+        """Queue one foreach CPU→NPU copy for a collection of tensors.
+
+        The operation intentionally has one completion event.  Callers can
+        therefore put one dependency on a compute stream instead of one
+        dependency per tensor.  Pageable sources are copied into temporary
+        pinned bounces before the foreach launch and released with the handle.
+        """
+        if self._closed:
+            raise RuntimeError(f"staging owner={self.owner!r} was closed")
+        sources = tuple(sources)
+        destinations = tuple(destinations)
+        self._validate_batch(sources, destinations, self.device)
+        pairs = [(src, dst) for src, dst in zip(sources, destinations, strict=True) if src.numel()]
+        sources = tuple(src for src, _ in pairs)
+        destinations = tuple(dst for _, dst in pairs)
+        if not sources:
+            event = torch_npu.npu.Event()
+            event.record(self.stream if stream is None else stream)
+            return TransferHandle(event)
+
+        target = self.stream if stream is None else stream
+        pageable = [source for source in sources if not source.is_pinned()]
+        bounces = self._allocate_batch_bounces(pageable) if pageable else []
+        try:
+            for original, (_raw, bounce) in zip(pageable, bounces, strict=True):
+                bounce.copy_(original)
+        except Exception:
+            self._free_bounces(bounces, self.owner)
+            raise
+        bounce_views = iter(view for _raw, view in bounces)
+        transfer_sources = [source if source.is_pinned() else next(bounce_views) for source in sources]
+        try:
+            with torch.no_grad(), torch_npu.npu.stream(target):
+                torch._foreach_copy_(list(destinations), transfer_sources, non_blocking=True)
+                for destination in destinations:
+                    destination.record_stream(target)
+                complete = torch_npu.npu.Event()
+                complete.record(target)
+        except Exception:
+            target.synchronize()
+            self._free_bounces(bounces, self.owner)
+            self._recover_transfer_error()
+            raise
+
+        finalize = None
+        if bounces:
+            finalize = lambda: self._free_bounces(bounces, self.owner)
+        handle = TransferHandle(complete, finalize)
+        if bounces:
+            self._batch_bounce_handles.append(handle)
+        if track:
+            self._pending.append(handle)
+        return handle
+
     def submit_d2h(
         self,
         source: torch.Tensor,
@@ -228,11 +329,82 @@ class CpuStaging:
             self._pending.append(handle)
         return handle
 
+    def submit_d2h_batch(
+        self,
+        sources: list[torch.Tensor] | tuple[torch.Tensor, ...],
+        destinations: list[torch.Tensor] | tuple[torch.Tensor, ...],
+        *,
+        producer_stream: Any | None = None,
+        stream: Any | None = None,
+        track: bool = True,
+    ) -> TransferHandle:
+        """Queue one foreach NPU→CPU copy for a collection of tensors."""
+        if self._closed:
+            raise RuntimeError(f"staging owner={self.owner!r} was closed")
+        sources = tuple(sources)
+        destinations = tuple(destinations)
+        self._validate_batch(destinations, sources, self.device)
+        pairs = [(src, dst) for src, dst in zip(sources, destinations, strict=True) if src.numel()]
+        sources = tuple(src for src, _ in pairs)
+        destinations = tuple(dst for _, dst in pairs)
+        if not sources:
+            event = torch_npu.npu.Event()
+            event.record(self.stream if stream is None else stream)
+            return TransferHandle(event)
+
+        target = self.stream if stream is None else stream
+        producer = producer_stream if producer_stream is not None else torch_npu.npu.current_stream(self.device)
+        pageable = [destination for destination in destinations if not destination.is_pinned()]
+        bounces = self._allocate_batch_bounces(pageable) if pageable else []
+        bounce_views = iter(view for _raw, view in bounces)
+        transfer_destinations = [
+            destination if destination.is_pinned() else next(bounce_views) for destination in destinations
+        ]
+        try:
+            with torch.no_grad(), torch_npu.npu.stream(target):
+                if producer is not target:
+                    ready = torch_npu.npu.Event()
+                    ready.record(producer)
+                    target.wait_event(ready)
+                torch._foreach_copy_(transfer_destinations, list(sources), non_blocking=True)
+                for source in sources:
+                    source.record_stream(target)
+                complete = torch_npu.npu.Event()
+                complete.record(target)
+        except Exception:
+            target.synchronize()
+            self._free_bounces(bounces, self.owner)
+            self._recover_transfer_error()
+            raise
+
+        finalize = None
+        if bounces:
+
+            def commit_batch() -> None:
+                complete.synchronize()
+                try:
+                    with torch.no_grad():
+                        torch._foreach_copy_(pageable, [view for _raw, view in bounces])
+                finally:
+                    self._free_bounces(bounces, self.owner)
+
+            future = self._completion_executor.submit(commit_batch)
+            finalize = future.result
+        handle = TransferHandle(complete, finalize)
+        if bounces:
+            self._batch_bounce_handles.append(handle)
+        if track:
+            self._pending.append(handle)
+        return handle
+
     def wait(self) -> None:
         """Finish all pending transfers and pageable host commits."""
         for handle in self._pending:
             handle.wait()
         self._pending.clear()
+        for handle in self._batch_bounce_handles:
+            handle.wait()
+        self._batch_bounce_handles.clear()
         self._release_bounces()
 
     def close(self) -> None:

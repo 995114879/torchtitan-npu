@@ -111,6 +111,23 @@ class _AccumPipeline:
         self.compute_stream = torch_npu.npu.Stream(device=self.device)
         self._slots: dict[tuple[torch.dtype, int], tuple[_AccumSlot, _AccumSlot]] = {}
         self._next_slot: dict[tuple[torch.dtype, int], int] = {}
+        self._batch_slots: dict[torch.dtype, list[_AccumSlot]] = {}
+        self._batch_next: dict[torch.dtype, int] = {}
+
+    def batch_slot(self, dtype: torch.dtype, numel: int) -> _AccumSlot:
+        """Keep two grow-only slabs per dtype, not one allocation per parameter."""
+        slots = self._batch_slots.setdefault(dtype, [])
+        index = self._batch_next.get(dtype, 0)
+        self._batch_next[dtype] = (index + 1) % 2
+        if index == len(slots):
+            slots.append(_AccumSlot(torch.empty(numel, dtype=dtype, device=self.device)))
+        slot = slots[index]
+        if slot.release is not None:
+            slot.release.wait_on(self.staging.stream)
+        if slot.buffer.numel() < numel:
+            # Both side streams record their use before a slab is retired.
+            slot.buffer = torch.empty(numel, dtype=dtype, device=self.device)
+        return slot
 
     def slots(
         self, dtype: torch.dtype, chunk_numel: int
@@ -131,9 +148,15 @@ class _AccumPipeline:
         return index
 
     def close(self) -> None:
+        for slots in (*self._slots.values(), *self._batch_slots.values()):
+            for slot in slots:
+                if slot.release is not None:
+                    slot.release.wait()
         self.staging.close()
         self._slots.clear()
         self._next_slot.clear()
+        self._batch_slots.clear()
+        self._batch_next.clear()
 
 
 _PIPELINES_BY_DEVICE: dict[torch.device, _AccumPipeline] = {}
@@ -165,6 +188,90 @@ def _pipeline_for(device: torch.device) -> _AccumPipeline:
         pipeline = _AccumPipeline(device)
         _PIPELINES_BY_DEVICE[device] = pipeline
     return pipeline
+
+
+@torch.no_grad()
+def accumulate_cpu_grads(
+    entries: list[tuple[Any, Tensor]],
+    compute_device: torch.device,
+    *,
+    stream: Any,
+) -> None:
+    """Batch one reduce group's pinned H2D, NPU addition and D2H per dtype."""
+    if not entries:
+        return
+    pipeline = _pipeline_for(compute_device)
+    transfer = pipeline.staging.stream
+    compute = pipeline.compute_stream
+    groups: dict[torch.dtype, list[tuple[Any, Tensor, Tensor]]] = {}
+    for param, incoming in entries:
+        canonical = local_tensor(param.sharded_param.grad)
+        if not canonical.is_pinned():
+            accumulate_cpu_grad(param, incoming, compute_device, stream=stream)
+            continue
+        if (
+            canonical.device.type != "cpu"
+            or incoming.device != torch.device(compute_device)
+            or canonical.dtype != incoming.dtype
+            or canonical.numel() != incoming.numel()
+            or not canonical.is_contiguous()
+            or not incoming.is_contiguous()
+        ):
+            raise RuntimeError("batched FSDP gradient accumulation requires matching contiguous CPU/NPU shards")
+        if not canonical.numel():
+            continue
+        previous = getattr(param, "grad_offload_event", None)
+        if previous is not None:
+            transfer.wait_event(previous)
+        groups.setdefault(canonical.dtype, []).append((param, canonical, incoming))
+    ready = torch_npu.npu.Event()
+    ready.record(stream)
+    compute.wait_event(ready)
+    for dtype, group in groups.items():
+        chunk_numel = max(1, _CHUNK_BYTES // group[0][1].element_size())
+        canonical_views: list[Tensor] = []
+        incoming_views: list[Tensor] = []
+        params: list[Any] = []
+        total = 0
+
+        def submit_chunk(batch_dtype: torch.dtype = dtype) -> None:
+            nonlocal canonical_views, incoming_views, params, total
+            if not canonical_views:
+                return
+            slot = pipeline.batch_slot(batch_dtype, total)
+            work = list(slot.buffer[:total].split([tensor.numel() for tensor in canonical_views]))
+            h2d = pipeline.staging.submit_h2d_batch(canonical_views, work, stream=transfer, track=False)
+            h2d.wait_on(compute)
+            with torch_npu.npu.stream(compute):
+                torch._foreach_add_(work, incoming_views)
+                slot.buffer.record_stream(compute)
+                for grad in incoming_views:
+                    grad.record_stream(compute)
+            done = pipeline.staging.submit_d2h_batch(
+                work, canonical_views, producer_stream=compute, stream=transfer, track=False
+            )
+            slot.release = done
+            for param in params:
+                param.grad_offload_event = done.event
+            canonical_views = []
+            incoming_views = []
+            params = []
+            total = 0
+
+        for param, cpu, grad in group:
+            cpu_flat = cpu.view(-1)
+            grad_flat = grad.view(-1)
+            offset = 0
+            while offset < cpu_flat.numel():
+                count = min(cpu_flat.numel() - offset, chunk_numel - total)
+                canonical_views.append(cpu_flat[offset : offset + count])
+                incoming_views.append(grad_flat[offset : offset + count])
+                params.append(param)
+                total += count
+                offset += count
+                if total == chunk_numel:
+                    submit_chunk()
+        submit_chunk()
 
 
 @torch.no_grad()
@@ -1051,6 +1158,7 @@ def _cpu_offload_foreach_reduce(
         # ``torch._foreach_copy_`` after the loop. Parameters that do not meet
         # the pooled-path conditions keep their per-parameter copy.
         pooled_offloads: list[tuple[Tensor, Tensor, Any]] = []
+        accumulated_offloads: list[tuple[Any, Tensor]] = []
         for padded_unsharded_size, fsdp_param in zip(padded_unsharded_sizes, fsdp_params, strict=False):
             # Assume even sharding for Shard(i), i > 0; otherwise would require
             # copy-out for contiguous strides
@@ -1066,16 +1174,16 @@ def _cpu_offload_foreach_reduce(
             has_post_acc_grad_hook = bool(getattr(fsdp_param.sharded_param, "_post_accumulate_grad_hooks", None))
             if fsdp_param.offload_to_cpu:
                 if to_accumulate_grad:
-                    # Accumulate into CPU-canonical storage on the NPU:
-                    # chunked H2D, add, and D2H through pinned bounce
-                    # buffers, all stream ordered.
-                    accumulate_cpu_grad(
-                        fsdp_param,
-                        new_sharded_grad,
-                        device,
-                        stream=post_reduce_stream,
-                        synchronous=has_post_acc_grad_hook,
-                    )
+                    if has_post_acc_grad_hook:
+                        accumulate_cpu_grad(
+                            fsdp_param,
+                            new_sharded_grad,
+                            device,
+                            stream=post_reduce_stream,
+                            synchronous=True,
+                        )
+                    else:
+                        accumulated_offloads.append((fsdp_param, new_sharded_grad))
                 else:
                     # First microbatch for this parameter: install a CPU-
                     # canonical gradient. Eligible pooled destinations are
@@ -1119,6 +1227,7 @@ def _cpu_offload_foreach_reduce(
                 hook(fsdp_param.sharded_param)
             padded_sharded_numel = padded_unsharded_size.numel() // world_size
             flat_grad_offset += padded_sharded_numel
+        accumulate_cpu_grads(accumulated_offloads, device, stream=post_reduce_stream)
         if pooled_offloads:
             # One batched D2H dispatch for the eligible pooled subset:
             # destinations are pre-carved pinned slots (truly asynchronous)
