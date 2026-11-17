@@ -55,6 +55,22 @@ torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套�
 
 > 注：安装 NNAL（Ascend Transformer Boost 加速库）前，请先执行 `source /usr/local/Ascend/cann/set_env.sh` 配置 CANN 环境变量。
 
+Triton-Ascend 在运行时编译本地扩展，需要支持 C++20 的 C++ 编译器，即使安装 wheel 也需要准备该工具链。同时需确保当前 Python 3.12 环境包含匹配的开发头文件（`Python.h`）。Debian/Ubuntu 可执行：
+
+```shell
+sudo apt-get update
+sudo apt-get install -y build-essential
+```
+
+Triton-Ascend 3.2.1 优先使用 `CC` 指定的编译器，否则依次查找 `clang++` 和 `g++`。如需指定编译器，应将 `CC` 设置为 C++ 编译器的可执行文件路径，例如 `export CC=/usr/bin/g++`；仅设置 `CXX` 不会改变该版本的选择。安装 Python 依赖前，检查实际选择的编译器：
+
+```shell
+cxx="${CC-$(command -v clang++ || command -v g++)}"
+test -n "$cxx" && "$cxx" --version
+printf '#include <span>\nint main() { int values[] = {0}; return std::span{values}[0]; }\n' | \
+  "$cxx" -std=c++20 -x c++ -fsyntax-only -
+```
+
 ### 2. 下载 torchtitan-npu 源码
 
 
