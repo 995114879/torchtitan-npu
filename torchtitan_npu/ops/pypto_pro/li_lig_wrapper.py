@@ -14,6 +14,7 @@ loss scalar. Integer LI selection and LIG launches do not expose double backward
 """
 
 import importlib
+import os
 from functools import cache
 
 import torch
@@ -27,6 +28,19 @@ def _load_operators():
     )
     li = importlib.import_module("torchtitan_npu.ops.pypto_pro.lightning_indexer.lightning_indexer")
     return li.lightning_indexer_pro, lig.sparse_li_klgrad_pro
+
+
+def _compact_keys(k, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k):
+    if seqused_q is not None and not torch.equal(seqused_q, torch.diff(cu_seqlens_q)):
+        raise ValueError("PyPTO-Pro LI/LIG requires compact query frames")
+    if seqused_k is None or torch.equal(seqused_k, torch.diff(cu_seqlens_k)):
+        return k, cu_seqlens_k, None
+    ends = torch.repeat_interleave(cu_seqlens_k[:-1] + seqused_k, torch.diff(cu_seqlens_k))
+    keep = torch.arange(ends.numel(), device=cu_seqlens_k.device) < ends
+    gather = torch.nonzero(keep, as_tuple=True)[0]
+    reach = seqused_k.to(torch.int64)
+    boundaries = torch.cat([reach.new_zeros(1), torch.cumsum(reach, 0)]).to(torch.int32)
+    return k.index_select(0, gather), boundaries, gather
 
 
 def _check_device(q: torch.Tensor) -> None:
@@ -56,7 +70,8 @@ def _check_compact_guard(guard_tensors: list[torch.Tensor] | None, guard_version
     device_types="npu",
     schema="(Tensor q, Tensor k, Tensor w, SymInt topk, Tensor cu_seqlens_q, Tensor cu_seqlens_k, "
     "Tensor cmp_residual_k, Tensor? metadata, str layout_q, str layout_k, SymInt mask_mode, "
-    "SymInt cmp_ratio, Tensor[]? guard_tensors=None, SymInt[]? guard_versions=None) -> (Tensor, Tensor)",
+    "SymInt cmp_ratio, Tensor[]? guard_tensors=None, SymInt[]? guard_versions=None, "
+    "Tensor? seqused_q=None, Tensor? seqused_k=None) -> (Tensor, Tensor)",
 )
 def lightning_indexer_indices(
     q: torch.Tensor,
@@ -73,11 +88,15 @@ def lightning_indexer_indices(
     cmp_ratio: int,
     guard_tensors: list[torch.Tensor] | None = None,
     guard_versions: list[int] | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     _check_compact_guard(guard_tensors, guard_versions)
     _check_device(q)
     with torch.get_device_module("npu").device(q.device):
+        os.environ.setdefault("TILE_FWK_DEVICE_ID", str(q.device.index))
         li, _ = _load_operators()
+        k, cu_seqlens_k, _ = _compact_keys(k, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         indices, values = li(
             q.contiguous(),
             k.contiguous(),
@@ -112,6 +131,8 @@ def _lightning_indexer_indices_fake(
     cmp_ratio,
     guard_tensors=None,
     guard_versions=None,
+    seqused_q=None,
+    seqused_k=None,
 ):
     return (
         q.new_empty((q.shape[0], k.shape[1], topk), dtype=torch.int32),
@@ -126,7 +147,8 @@ def _lightning_indexer_indices_fake(
     schema="(Tensor q, Tensor k, Tensor w, Tensor sparse_indices, Tensor attn_softmax_l1_norm, "
     "Tensor cu_seqlens_q, Tensor cu_seqlens_k, Tensor cmp_residual_k, Tensor? metadata, "
     "str layout_q, str layout_k, SymInt mask_mode, SymInt cmp_ratio, "
-    "Tensor[]? guard_tensors=None, SymInt[]? guard_versions=None) -> (Tensor, Tensor, Tensor, Tensor)",
+    "Tensor[]? guard_tensors=None, SymInt[]? guard_versions=None, "
+    "Tensor? seqused_q=None, Tensor? seqused_k=None) -> (Tensor, Tensor, Tensor, Tensor)",
 )
 def sparse_lightning_indexer_kl_loss_grad(
     q: torch.Tensor,
@@ -144,14 +166,18 @@ def sparse_lightning_indexer_kl_loss_grad(
     cmp_ratio: int,
     guard_tensors: list[torch.Tensor] | None = None,
     guard_versions: list[int] | None = None,
+    seqused_q: torch.Tensor | None = None,
+    seqused_k: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _check_compact_guard(guard_tensors, guard_versions)
     _check_device(q)
     with torch.get_device_module("npu").device(q.device):
+        os.environ.setdefault("TILE_FWK_DEVICE_ID", str(q.device.index))
         _, lig = _load_operators()
-        return lig(
+        compact_k, cu_seqlens_k, gather = _compact_keys(k, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        dq, dk, dw, softmax = lig(
             query=q.contiguous(),
-            key=k.contiguous(),
+            key=compact_k.contiguous(),
             weights=w.contiguous(),
             sparse_indices=sparse_indices,
             attn_softmax_l1_norm=attn_softmax_l1_norm,
@@ -164,6 +190,11 @@ def sparse_lightning_indexer_kl_loss_grad(
             mask_mode=mask_mode,
             cmp_ratio=cmp_ratio,
         )
+        if gather is not None:
+            restored_dk = torch.zeros(k.shape, dtype=dk.dtype, device=k.device)
+            restored_dk.index_copy_(0, gather, dk)
+            dk = restored_dk
+        return dq, dk, dw, softmax
 
 
 @sparse_lightning_indexer_kl_loss_grad.register_fake
@@ -183,6 +214,8 @@ def _sparse_lightning_indexer_kl_loss_grad_fake(
     cmp_ratio,
     guard_tensors=None,
     guard_versions=None,
+    seqused_q=None,
+    seqused_k=None,
 ):
     return (
         q.new_empty(q.shape, dtype=torch.bfloat16),

@@ -37,9 +37,6 @@ def _pro_options(metadata: AscV4Metadata, ratio: int) -> dict:
     key_frame = metadata.cmp_k
     assert key_frame is not None, "the indexer needs the entry's compressed frame"
     options = kernel_options(ratio=ratio, q=metadata.q, cmp_k=key_frame)
-    # This Pro kernel pair reads compact boundaries, not seqused; the frames are compact by
-    # construction because the indexer refuses context parallel.
-    del options["seqused_q"], options["seqused_k"]
     return options
 
 

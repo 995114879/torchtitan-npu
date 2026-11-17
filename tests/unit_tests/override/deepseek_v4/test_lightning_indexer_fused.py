@@ -270,6 +270,8 @@ def test_pypto_pro_override_dispatches_forward_and_backward(monkeypatch, batch_s
         cmp_ratio,
         guard_tensors=None,
         guard_versions=None,
+        seqused_q=None,
+        seqused_k=None,
     ):
         captured["li"].append(
             (q, k, w, cu_seqlens_q, cu_seqlens_k, cmp_residual_k, metadata, (layout_q, layout_k, mask_mode, cmp_ratio))
@@ -296,6 +298,8 @@ def test_pypto_pro_override_dispatches_forward_and_backward(monkeypatch, batch_s
         cmp_ratio,
         guard_tensors=None,
         guard_versions=None,
+        seqused_q=None,
+        seqused_k=None,
     ):
         captured["lig"].append(
             (q, k, w, cu_seqlens_q, cu_seqlens_k, cmp_residual_k, metadata, (layout_q, layout_k, mask_mode, cmp_ratio))

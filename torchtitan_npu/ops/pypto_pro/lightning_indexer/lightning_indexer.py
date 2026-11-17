@@ -739,7 +739,7 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
         for i in pl.range(0, nloads):
             hlo, hhi = vf.load_align(kh + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo, lhi = vf.load_align(kl + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            e_kb3 = vf.eq(hhi, kb3, pb8, cmp_dtype=pl.DT_UINT8)
+            e_kb3 = vf.eq(hhi, kb3, pb8)
             m = e_kb3
             c0 = vf.histograms(hlo, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx = vf.xor(hlo, x80, pb8)
@@ -768,8 +768,8 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
         for i in pl.range(0, nloads):
             hlo, hhi = vf.load_align(kh + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo, lhi = vf.load_align(kl + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            e_kb3 = vf.eq(hhi, kb3, pb8, cmp_dtype=pl.DT_UINT8)
-            m = vf.eq(hlo, kb2, e_kb3, cmp_dtype=pl.DT_UINT8)
+            e_kb3 = vf.eq(hhi, kb3, pb8)
+            m = vf.eq(hlo, kb2, e_kb3)
             c0 = vf.histograms(lhi, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx = vf.xor(lhi, x80, pb8)
             c1 = vf.histograms(vx, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
@@ -798,9 +798,9 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
         for i in pl.range(0, nloads):
             hlo, hhi = vf.load_align(kh + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo, lhi = vf.load_align(kl + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            e_kb3 = vf.eq(hhi, kb3, pb8, cmp_dtype=pl.DT_UINT8)
-            e_kb2 = vf.eq(hlo, kb2, e_kb3, cmp_dtype=pl.DT_UINT8)
-            m = vf.eq(lhi, kb1, e_kb2, cmp_dtype=pl.DT_UINT8)
+            e_kb3 = vf.eq(hhi, kb3, pb8)
+            e_kb2 = vf.eq(hlo, kb2, e_kb3)
+            m = vf.eq(lhi, kb1, e_kb2)
             c0 = vf.histograms(llo, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx = vf.xor(llo, x80, pb8)
             c1 = vf.histograms(vx, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
@@ -826,9 +826,9 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             idx_c = vf.arange(i * 64, dtype=pl.DT_UINT32)
             cout = vf.load_align(hist_t, i * 64)
             pge = vf.ge(cout, btm, pb32)
-            sq = vf.squeeze(idx_c, pge, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT32)
-            vf.store_unalign(sqz_t, sq, al, post_update=True)
-        vf.store_unalign_post(sqz_t, al)
+            sq = vf.squeeze(idx_c, pge, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sqz_t, sq, al)
+        vf.squeeze_store_unalign_post(sqz_t, al)
         vf.mem_bar()
         idx_b = vf.load_align(sqz_t, 0, dist=pl.LoadDist.BRC_B8)
         one = vf.full(0x01010101, dtype=pl.DT_UINT32)
@@ -889,17 +889,17 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             gl = vf.gt(lo, lb, pb16)
             t1 = vf.and_(eh, gl, pb16)
             m = vf.or_(gh, t1, pb16)
-            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
+            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
         for w in pl.range(0, nwin):
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
             eh = vf.eq(hi, kb, pb16)
             el = vf.eq(lo, lb, pb16)
             m = vf.and_(eh, el, pb16)
-            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
-        vf.store_unalign_post(dst, ar)
+            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
+        vf.squeeze_store_unalign_post(dst, ar)
         vf.mem_bar()
 
     @pl.vector_function
@@ -917,17 +917,17 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             gl = vf.gt(lo, lb, pb16)
             t1 = vf.and_(eh, gl, pb16)
             m = vf.or_(gh, t1, pb16)
-            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
+            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
         for w in pl.range(0, nwin):
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
             eh = vf.eq(hi, kb, pb16)
             el = vf.eq(lo, lb, pb16)
             m = vf.and_(eh, el, pb16)
-            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
-        vf.store_unalign_post(dst, ar)
+            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
+        vf.squeeze_store_unalign_post(dst, ar)
         vf.mem_bar()
 
     @pl.vector_function
@@ -962,10 +962,10 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.load_align(ki + ibase, w * 128)
             ib = vf.load_align(ki + ibase, w * 128 + 64)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
         for w in pl.range(nreg0, nwin):  # raw GT
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
@@ -982,10 +982,10 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.arange(base0 + (w - nreg0) * 128, dtype=pl.DT_INT32)
             ib = vf.arange(base0 + (w - nreg0) * 128 + 64, dtype=pl.DT_INT32)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
         for w in pl.range(0, nreg0):  # region0 EQ
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
@@ -1000,10 +1000,10 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.load_align(ki + ibase, w * 128)
             ib = vf.load_align(ki + ibase, w * 128 + 64)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
         for w in pl.range(nreg0, nwin):  # raw EQ
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
@@ -1018,11 +1018,11 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.arange(base0 + (w - nreg0) * 128, dtype=pl.DT_INT32)
             ib = vf.arange(base0 + (w - nreg0) * 128 + 64, dtype=pl.DT_INT32)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
-        vf.store_unalign_post(si, ar)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
+        vf.squeeze_store_unalign_post(si, ar)
         vf.mem_bar()
 
     @pl.vector_function
@@ -1142,16 +1142,10 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
         scr_hi_db,
         scr_lo_db,
         scr_idx_db,
-        hist_t,
-        sqz_t,
-        kb3_t,
-        kb2_t,
-        kb1_t,
-        kb0_t,
-        nextk_t,
-        kth_hi_t,
-        kth_lo_t,
+        scratch,
     ):
+        # Tuple forwarding keeps scratch tiles out of the scalar pipeline context.
+        hist_t, sqz_t, kb3_t, kb2_t, kb1_t, kb0_t, nextk_t, kth_hi_t, kth_lo_t = scratch
         sv = score_db.next()  # unconditional rotation every tick
         # BP-7 touch DELETED, and in this file qk_touch_db is not declared at all: the
         # Module-2 block below passes `sv` bare and positional to _vf_score_keys, which is
@@ -1203,6 +1197,9 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
                 if gk == first:  # weights: MTE2 once per grid block
                     pl.set_validshape(wt, [rows2, WCOL])
                     pl.load(wt, w2d, [r0 + r_lo2, 0])
+                    # Masked rows may not consume W on V; fence before its next reuse.
+                    pl.system.mutex_lock(pipe=pl.PipeType.V, mutex_id=10)
+                    pl.system.mutex_unlock(pipe=pl.PipeType.V, mutex_id=10)
                 kh = key_hi_db.current()
                 kl = key_lo_db.current()
                 pl.set_validshape(kh, [RPA, CAP])  # widen back before the VF writes; the
@@ -1670,6 +1667,7 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
             kth_lo_t = pl.make_tile(
                 pl.TileType(shape=[1, 64], dtype=pl.DT_UINT32, target_memory=pl.MemorySpace.Vec), addr=VA_KTLO
             )
+            scratch = (hist_t, sqz_t, kb3_t, kb2_t, kb1_t, kb0_t, nextk_t, kth_hi_t, kth_lo_t)
 
         # (4) the single pipeline loop: one cube stage block + one vector stage block
         n_blk = pl.max(1, (nb_grid + num_cores - 1) // num_cores)
@@ -1779,15 +1777,7 @@ def _make_li_pro_kernel_long(n1, topk, spread=0):
                         scr_hi_db,
                         scr_lo_db,
                         scr_idx_db,
-                        hist_t,
-                        sqz_t,
-                        kb3_t,
-                        kb2_t,
-                        kb1_t,
-                        kb0_t,
-                        nextk_t,
-                        kth_hi_t,
-                        kth_lo_t,
+                        scratch,
                     )
         # (5) DESIGN section 4 item 5: trivial rows (numValid <= TOPK) need no Cube work and no
         #     selection -- arange(nv) then -1 pad.  Own vector-only section after the pipeline.
@@ -2356,15 +2346,15 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r0_c1_0 = vf.histograms(r0_vx0, r0_pb8, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r0_tot0 = vf.full(r0_c0_0, r0_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r0_c1g0 = vf.add(r0_c1_0, r0_tot0, r0_pb16)
-        r0_ge0_0 = vf.ge(r0_c0_0, r0_rank0, r0_pb16, cmp_dtype=pl.DT_UINT16)
-        r0_ge1_0 = vf.ge(r0_c1g0, r0_rank0, r0_pb16, cmp_dtype=pl.DT_UINT16)
+        r0_ge0_0 = vf.ge(r0_c0_0, r0_rank0, r0_pb16)
+        r0_ge1_0 = vf.ge(r0_c1g0, r0_rank0, r0_pb16)
         r0_e0_0 = vf.select(r0_idx0, r0_sentinel, r0_ge0_0)
         r0_e1_0 = vf.select(r0_idx1, r0_sentinel, r0_ge1_0)
         r0_eligible0 = vf.min(r0_e0_0, r0_e1_0, r0_pb16)
         r0_chosen0 = vf.reduce_min(r0_eligible0, r0_pb16)
         r0_digit0 = vf.full(r0_chosen0, r0_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        r0_lt0_0 = vf.lt(r0_c0_0, r0_rank0, r0_pb16, cmp_dtype=pl.DT_UINT16)
-        r0_lt1_0 = vf.lt(r0_c1g0, r0_rank0, r0_pb16, cmp_dtype=pl.DT_UINT16)
+        r0_lt0_0 = vf.lt(r0_c0_0, r0_rank0, r0_pb16)
+        r0_lt1_0 = vf.lt(r0_c1g0, r0_rank0, r0_pb16)
         r0_p0_0 = vf.select(r0_c0_0, r0_zero16, r0_lt0_0)
         r0_p1_0 = vf.select(r0_c1g0, r0_zero16, r0_lt1_0)
         r0_below0 = vf.max(r0_p0_0, r0_p1_0, r0_pb16)
@@ -2380,21 +2370,21 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r0_hlo1, r0_hhi1 = vf.load_align(
                 kh + (0 * CAP + TOPK), r0_i1 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8
             )
-            r0_pm1_0 = vf.eq(r0_hhi1, r0_byte0, r0_pb8, cmp_dtype=pl.DT_UINT8)
+            r0_pm1_0 = vf.eq(r0_hhi1, r0_byte0, r0_pb8)
             r0_c0_1 = vf.histograms(r0_hlo1, r0_pm1_0, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             r0_vx1 = vf.xor(r0_hlo1, r0_x80, r0_pb8)
             r0_c1_1 = vf.histograms(r0_vx1, r0_pm1_0, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r0_tot1 = vf.full(r0_c0_1, r0_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r0_c1g1 = vf.add(r0_c1_1, r0_tot1, r0_pb16)
-        r0_ge0_1 = vf.ge(r0_c0_1, r0_rank1, r0_pb16, cmp_dtype=pl.DT_UINT16)
-        r0_ge1_1 = vf.ge(r0_c1g1, r0_rank1, r0_pb16, cmp_dtype=pl.DT_UINT16)
+        r0_ge0_1 = vf.ge(r0_c0_1, r0_rank1, r0_pb16)
+        r0_ge1_1 = vf.ge(r0_c1g1, r0_rank1, r0_pb16)
         r0_e0_1 = vf.select(r0_idx0, r0_sentinel, r0_ge0_1)
         r0_e1_1 = vf.select(r0_idx1, r0_sentinel, r0_ge1_1)
         r0_eligible1 = vf.min(r0_e0_1, r0_e1_1, r0_pb16)
         r0_chosen1 = vf.reduce_min(r0_eligible1, r0_pb16)
         r0_digit1 = vf.full(r0_chosen1, r0_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        r0_lt0_1 = vf.lt(r0_c0_1, r0_rank1, r0_pb16, cmp_dtype=pl.DT_UINT16)
-        r0_lt1_1 = vf.lt(r0_c1g1, r0_rank1, r0_pb16, cmp_dtype=pl.DT_UINT16)
+        r0_lt0_1 = vf.lt(r0_c0_1, r0_rank1, r0_pb16)
+        r0_lt1_1 = vf.lt(r0_c1g1, r0_rank1, r0_pb16)
         r0_p0_1 = vf.select(r0_c0_1, r0_zero16, r0_lt0_1)
         r0_p1_1 = vf.select(r0_c1g1, r0_zero16, r0_lt1_1)
         r0_below1 = vf.max(r0_p0_1, r0_p1_1, r0_pb16)
@@ -2413,22 +2403,22 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r0_llo2, r0_lhi2 = vf.load_align(
                 kl + (0 * CAP + TOPK), r0_i2 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8
             )
-            r0_pm2_0 = vf.eq(r0_hhi2, r0_byte0, r0_pb8, cmp_dtype=pl.DT_UINT8)
-            r0_pm2_1 = vf.eq(r0_hlo2, r0_byte1, r0_pm2_0, cmp_dtype=pl.DT_UINT8)
+            r0_pm2_0 = vf.eq(r0_hhi2, r0_byte0, r0_pb8)
+            r0_pm2_1 = vf.eq(r0_hlo2, r0_byte1, r0_pm2_0)
             r0_c0_2 = vf.histograms(r0_lhi2, r0_pm2_1, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             r0_vx2 = vf.xor(r0_lhi2, r0_x80, r0_pb8)
             r0_c1_2 = vf.histograms(r0_vx2, r0_pm2_1, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r0_tot2 = vf.full(r0_c0_2, r0_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r0_c1g2 = vf.add(r0_c1_2, r0_tot2, r0_pb16)
-        r0_ge0_2 = vf.ge(r0_c0_2, r0_rank2, r0_pb16, cmp_dtype=pl.DT_UINT16)
-        r0_ge1_2 = vf.ge(r0_c1g2, r0_rank2, r0_pb16, cmp_dtype=pl.DT_UINT16)
+        r0_ge0_2 = vf.ge(r0_c0_2, r0_rank2, r0_pb16)
+        r0_ge1_2 = vf.ge(r0_c1g2, r0_rank2, r0_pb16)
         r0_e0_2 = vf.select(r0_idx0, r0_sentinel, r0_ge0_2)
         r0_e1_2 = vf.select(r0_idx1, r0_sentinel, r0_ge1_2)
         r0_eligible2 = vf.min(r0_e0_2, r0_e1_2, r0_pb16)
         r0_chosen2 = vf.reduce_min(r0_eligible2, r0_pb16)
         r0_digit2 = vf.full(r0_chosen2, r0_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        r0_lt0_2 = vf.lt(r0_c0_2, r0_rank2, r0_pb16, cmp_dtype=pl.DT_UINT16)
-        r0_lt1_2 = vf.lt(r0_c1g2, r0_rank2, r0_pb16, cmp_dtype=pl.DT_UINT16)
+        r0_lt0_2 = vf.lt(r0_c0_2, r0_rank2, r0_pb16)
+        r0_lt1_2 = vf.lt(r0_c1g2, r0_rank2, r0_pb16)
         r0_p0_2 = vf.select(r0_c0_2, r0_zero16, r0_lt0_2)
         r0_p1_2 = vf.select(r0_c1g2, r0_zero16, r0_lt1_2)
         r0_below2 = vf.max(r0_p0_2, r0_p1_2, r0_pb16)
@@ -2447,16 +2437,16 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r0_llo3, r0_lhi3 = vf.load_align(
                 kl + (0 * CAP + TOPK), r0_i3 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8
             )
-            r0_pm3_0 = vf.eq(r0_hhi3, r0_byte0, r0_pb8, cmp_dtype=pl.DT_UINT8)
-            r0_pm3_1 = vf.eq(r0_hlo3, r0_byte1, r0_pm3_0, cmp_dtype=pl.DT_UINT8)
-            r0_pm3_2 = vf.eq(r0_lhi3, r0_byte2, r0_pm3_1, cmp_dtype=pl.DT_UINT8)
+            r0_pm3_0 = vf.eq(r0_hhi3, r0_byte0, r0_pb8)
+            r0_pm3_1 = vf.eq(r0_hlo3, r0_byte1, r0_pm3_0)
+            r0_pm3_2 = vf.eq(r0_lhi3, r0_byte2, r0_pm3_1)
             r0_c0_3 = vf.histograms(r0_llo3, r0_pm3_2, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             r0_vx3 = vf.xor(r0_llo3, r0_x80, r0_pb8)
             r0_c1_3 = vf.histograms(r0_vx3, r0_pm3_2, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r0_tot3 = vf.full(r0_c0_3, r0_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r0_c1g3 = vf.add(r0_c1_3, r0_tot3, r0_pb16)
-        r0_ge0_3 = vf.ge(r0_c0_3, r0_rank3, r0_pb16, cmp_dtype=pl.DT_UINT16)
-        r0_ge1_3 = vf.ge(r0_c1g3, r0_rank3, r0_pb16, cmp_dtype=pl.DT_UINT16)
+        r0_ge0_3 = vf.ge(r0_c0_3, r0_rank3, r0_pb16)
+        r0_ge1_3 = vf.ge(r0_c1g3, r0_rank3, r0_pb16)
         r0_e0_3 = vf.select(r0_idx0, r0_sentinel, r0_ge0_3)
         r0_e1_3 = vf.select(r0_idx1, r0_sentinel, r0_ge1_3)
         r0_eligible3 = vf.min(r0_e0_3, r0_e1_3, r0_pb16)
@@ -2486,8 +2476,8 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             c0_m = vf.or_(c0_gh, c0_t1, c0_pb16)
             c0_ordinal = vf.arange(c0_w * 128, dtype=pl.DT_UINT16)
             c0_local = vf.sub(c0_ordinal, c0_offset, c0_pb16)
-            c0_packed = vf.squeeze(c0_local, c0_m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(sh, c0_packed, c0_ar, post_update=True)
+            c0_packed = vf.squeeze(c0_local, c0_m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sh, c0_packed, c0_ar)
         for c0_w in pl.range(0, nev):
             c0_hi = vf.load_align(kh + (0 * CAP + TOPK), c0_w * 128)
             c0_lo = vf.load_align(kl + (0 * CAP + TOPK), c0_w * 128)
@@ -2496,9 +2486,9 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             c0_m = vf.and_(c0_eh, c0_el, c0_pb16)
             c0_ordinal = vf.arange(c0_w * 128, dtype=pl.DT_UINT16)
             c0_local = vf.sub(c0_ordinal, c0_offset, c0_pb16)
-            c0_packed = vf.squeeze(c0_local, c0_m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(sh, c0_packed, c0_ar, post_update=True)
-        vf.store_unalign_post(sh, c0_ar)
+            c0_packed = vf.squeeze(c0_local, c0_m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sh, c0_packed, c0_ar)
+        vf.squeeze_store_unalign_post(sh, c0_ar)
         vf.mem_bar()
         for c0_out in pl.range(0, 8):
             c0_unpacked = vf.load_align(sh, c0_out * 64, dist=pl.LoadDist.UNPK_B16, dtype=pl.DT_UINT16)
@@ -2533,15 +2523,15 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r1_c1_0 = vf.histograms(r1_vx0, r1_pb8, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r1_tot0 = vf.full(r1_c0_0, r1_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r1_c1g0 = vf.add(r1_c1_0, r1_tot0, r1_pb16)
-        r1_ge0_0 = vf.ge(r1_c0_0, r1_rank0, r1_pb16, cmp_dtype=pl.DT_UINT16)
-        r1_ge1_0 = vf.ge(r1_c1g0, r1_rank0, r1_pb16, cmp_dtype=pl.DT_UINT16)
+        r1_ge0_0 = vf.ge(r1_c0_0, r1_rank0, r1_pb16)
+        r1_ge1_0 = vf.ge(r1_c1g0, r1_rank0, r1_pb16)
         r1_e0_0 = vf.select(r1_idx0, r1_sentinel, r1_ge0_0)
         r1_e1_0 = vf.select(r1_idx1, r1_sentinel, r1_ge1_0)
         r1_eligible0 = vf.min(r1_e0_0, r1_e1_0, r1_pb16)
         r1_chosen0 = vf.reduce_min(r1_eligible0, r1_pb16)
         r1_digit0 = vf.full(r1_chosen0, r1_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        r1_lt0_0 = vf.lt(r1_c0_0, r1_rank0, r1_pb16, cmp_dtype=pl.DT_UINT16)
-        r1_lt1_0 = vf.lt(r1_c1g0, r1_rank0, r1_pb16, cmp_dtype=pl.DT_UINT16)
+        r1_lt0_0 = vf.lt(r1_c0_0, r1_rank0, r1_pb16)
+        r1_lt1_0 = vf.lt(r1_c1g0, r1_rank0, r1_pb16)
         r1_p0_0 = vf.select(r1_c0_0, r1_zero16, r1_lt0_0)
         r1_p1_0 = vf.select(r1_c1g0, r1_zero16, r1_lt1_0)
         r1_below0 = vf.max(r1_p0_0, r1_p1_0, r1_pb16)
@@ -2557,21 +2547,21 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r1_hlo1, r1_hhi1 = vf.load_align(
                 kh + (1 * CAP + TOPK), r1_i1 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8
             )
-            r1_pm1_0 = vf.eq(r1_hhi1, r1_byte0, r1_pb8, cmp_dtype=pl.DT_UINT8)
+            r1_pm1_0 = vf.eq(r1_hhi1, r1_byte0, r1_pb8)
             r1_c0_1 = vf.histograms(r1_hlo1, r1_pm1_0, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             r1_vx1 = vf.xor(r1_hlo1, r1_x80, r1_pb8)
             r1_c1_1 = vf.histograms(r1_vx1, r1_pm1_0, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r1_tot1 = vf.full(r1_c0_1, r1_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r1_c1g1 = vf.add(r1_c1_1, r1_tot1, r1_pb16)
-        r1_ge0_1 = vf.ge(r1_c0_1, r1_rank1, r1_pb16, cmp_dtype=pl.DT_UINT16)
-        r1_ge1_1 = vf.ge(r1_c1g1, r1_rank1, r1_pb16, cmp_dtype=pl.DT_UINT16)
+        r1_ge0_1 = vf.ge(r1_c0_1, r1_rank1, r1_pb16)
+        r1_ge1_1 = vf.ge(r1_c1g1, r1_rank1, r1_pb16)
         r1_e0_1 = vf.select(r1_idx0, r1_sentinel, r1_ge0_1)
         r1_e1_1 = vf.select(r1_idx1, r1_sentinel, r1_ge1_1)
         r1_eligible1 = vf.min(r1_e0_1, r1_e1_1, r1_pb16)
         r1_chosen1 = vf.reduce_min(r1_eligible1, r1_pb16)
         r1_digit1 = vf.full(r1_chosen1, r1_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        r1_lt0_1 = vf.lt(r1_c0_1, r1_rank1, r1_pb16, cmp_dtype=pl.DT_UINT16)
-        r1_lt1_1 = vf.lt(r1_c1g1, r1_rank1, r1_pb16, cmp_dtype=pl.DT_UINT16)
+        r1_lt0_1 = vf.lt(r1_c0_1, r1_rank1, r1_pb16)
+        r1_lt1_1 = vf.lt(r1_c1g1, r1_rank1, r1_pb16)
         r1_p0_1 = vf.select(r1_c0_1, r1_zero16, r1_lt0_1)
         r1_p1_1 = vf.select(r1_c1g1, r1_zero16, r1_lt1_1)
         r1_below1 = vf.max(r1_p0_1, r1_p1_1, r1_pb16)
@@ -2590,22 +2580,22 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r1_llo2, r1_lhi2 = vf.load_align(
                 kl + (1 * CAP + TOPK), r1_i2 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8
             )
-            r1_pm2_0 = vf.eq(r1_hhi2, r1_byte0, r1_pb8, cmp_dtype=pl.DT_UINT8)
-            r1_pm2_1 = vf.eq(r1_hlo2, r1_byte1, r1_pm2_0, cmp_dtype=pl.DT_UINT8)
+            r1_pm2_0 = vf.eq(r1_hhi2, r1_byte0, r1_pb8)
+            r1_pm2_1 = vf.eq(r1_hlo2, r1_byte1, r1_pm2_0)
             r1_c0_2 = vf.histograms(r1_lhi2, r1_pm2_1, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             r1_vx2 = vf.xor(r1_lhi2, r1_x80, r1_pb8)
             r1_c1_2 = vf.histograms(r1_vx2, r1_pm2_1, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r1_tot2 = vf.full(r1_c0_2, r1_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r1_c1g2 = vf.add(r1_c1_2, r1_tot2, r1_pb16)
-        r1_ge0_2 = vf.ge(r1_c0_2, r1_rank2, r1_pb16, cmp_dtype=pl.DT_UINT16)
-        r1_ge1_2 = vf.ge(r1_c1g2, r1_rank2, r1_pb16, cmp_dtype=pl.DT_UINT16)
+        r1_ge0_2 = vf.ge(r1_c0_2, r1_rank2, r1_pb16)
+        r1_ge1_2 = vf.ge(r1_c1g2, r1_rank2, r1_pb16)
         r1_e0_2 = vf.select(r1_idx0, r1_sentinel, r1_ge0_2)
         r1_e1_2 = vf.select(r1_idx1, r1_sentinel, r1_ge1_2)
         r1_eligible2 = vf.min(r1_e0_2, r1_e1_2, r1_pb16)
         r1_chosen2 = vf.reduce_min(r1_eligible2, r1_pb16)
         r1_digit2 = vf.full(r1_chosen2, r1_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        r1_lt0_2 = vf.lt(r1_c0_2, r1_rank2, r1_pb16, cmp_dtype=pl.DT_UINT16)
-        r1_lt1_2 = vf.lt(r1_c1g2, r1_rank2, r1_pb16, cmp_dtype=pl.DT_UINT16)
+        r1_lt0_2 = vf.lt(r1_c0_2, r1_rank2, r1_pb16)
+        r1_lt1_2 = vf.lt(r1_c1g2, r1_rank2, r1_pb16)
         r1_p0_2 = vf.select(r1_c0_2, r1_zero16, r1_lt0_2)
         r1_p1_2 = vf.select(r1_c1g2, r1_zero16, r1_lt1_2)
         r1_below2 = vf.max(r1_p0_2, r1_p1_2, r1_pb16)
@@ -2624,16 +2614,16 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             r1_llo3, r1_lhi3 = vf.load_align(
                 kl + (1 * CAP + TOPK), r1_i3 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8
             )
-            r1_pm3_0 = vf.eq(r1_hhi3, r1_byte0, r1_pb8, cmp_dtype=pl.DT_UINT8)
-            r1_pm3_1 = vf.eq(r1_hlo3, r1_byte1, r1_pm3_0, cmp_dtype=pl.DT_UINT8)
-            r1_pm3_2 = vf.eq(r1_lhi3, r1_byte2, r1_pm3_1, cmp_dtype=pl.DT_UINT8)
+            r1_pm3_0 = vf.eq(r1_hhi3, r1_byte0, r1_pb8)
+            r1_pm3_1 = vf.eq(r1_hlo3, r1_byte1, r1_pm3_0)
+            r1_pm3_2 = vf.eq(r1_lhi3, r1_byte2, r1_pm3_1)
             r1_c0_3 = vf.histograms(r1_llo3, r1_pm3_2, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             r1_vx3 = vf.xor(r1_llo3, r1_x80, r1_pb8)
             r1_c1_3 = vf.histograms(r1_vx3, r1_pm3_2, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         r1_tot3 = vf.full(r1_c0_3, r1_pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         r1_c1g3 = vf.add(r1_c1_3, r1_tot3, r1_pb16)
-        r1_ge0_3 = vf.ge(r1_c0_3, r1_rank3, r1_pb16, cmp_dtype=pl.DT_UINT16)
-        r1_ge1_3 = vf.ge(r1_c1g3, r1_rank3, r1_pb16, cmp_dtype=pl.DT_UINT16)
+        r1_ge0_3 = vf.ge(r1_c0_3, r1_rank3, r1_pb16)
+        r1_ge1_3 = vf.ge(r1_c1g3, r1_rank3, r1_pb16)
         r1_e0_3 = vf.select(r1_idx0, r1_sentinel, r1_ge0_3)
         r1_e1_3 = vf.select(r1_idx1, r1_sentinel, r1_ge1_3)
         r1_eligible3 = vf.min(r1_e0_3, r1_e1_3, r1_pb16)
@@ -2663,8 +2653,8 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             c1_m = vf.or_(c1_gh, c1_t1, c1_pb16)
             c1_ordinal = vf.arange(c1_w * 128, dtype=pl.DT_UINT16)
             c1_local = vf.sub(c1_ordinal, c1_offset, c1_pb16)
-            c1_packed = vf.squeeze(c1_local, c1_m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(sh, c1_packed, c1_ar, post_update=True)
+            c1_packed = vf.squeeze(c1_local, c1_m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sh, c1_packed, c1_ar)
         for c1_w in pl.range(0, nev):
             c1_hi = vf.load_align(kh + (1 * CAP + TOPK), c1_w * 128)
             c1_lo = vf.load_align(kl + (1 * CAP + TOPK), c1_w * 128)
@@ -2673,9 +2663,9 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             c1_m = vf.and_(c1_eh, c1_el, c1_pb16)
             c1_ordinal = vf.arange(c1_w * 128, dtype=pl.DT_UINT16)
             c1_local = vf.sub(c1_ordinal, c1_offset, c1_pb16)
-            c1_packed = vf.squeeze(c1_local, c1_m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(sh, c1_packed, c1_ar, post_update=True)
-        vf.store_unalign_post(sh, c1_ar)
+            c1_packed = vf.squeeze(c1_local, c1_m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sh, c1_packed, c1_ar)
+        vf.squeeze_store_unalign_post(sh, c1_ar)
         vf.mem_bar()
         for c1_out in pl.range(0, 8):
             c1_unpacked = vf.load_align(sh, c1_out * 64, dist=pl.LoadDist.UNPK_B16, dtype=pl.DT_UINT16)
@@ -2811,7 +2801,7 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
         for i in pl.range(0, nloads):
             hlo, hhi = vf.load_align(kh + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo, lhi = vf.load_align(kl + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            e_kb3 = vf.eq(hhi, kb3, pb8, cmp_dtype=pl.DT_UINT8)
+            e_kb3 = vf.eq(hhi, kb3, pb8)
             m = e_kb3
             c0 = vf.histograms(hlo, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx = vf.xor(hlo, x80, pb8)
@@ -2840,8 +2830,8 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
         for i in pl.range(0, nloads):
             hlo, hhi = vf.load_align(kh + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo, lhi = vf.load_align(kl + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            e_kb3 = vf.eq(hhi, kb3, pb8, cmp_dtype=pl.DT_UINT8)
-            m = vf.eq(hlo, kb2, e_kb3, cmp_dtype=pl.DT_UINT8)
+            e_kb3 = vf.eq(hhi, kb3, pb8)
+            m = vf.eq(hlo, kb2, e_kb3)
             c0 = vf.histograms(lhi, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx = vf.xor(lhi, x80, pb8)
             c1 = vf.histograms(vx, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
@@ -2870,9 +2860,9 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
         for i in pl.range(0, nloads):
             hlo, hhi = vf.load_align(kh + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo, lhi = vf.load_align(kl + base, i * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            e_kb3 = vf.eq(hhi, kb3, pb8, cmp_dtype=pl.DT_UINT8)
-            e_kb2 = vf.eq(hlo, kb2, e_kb3, cmp_dtype=pl.DT_UINT8)
-            m = vf.eq(lhi, kb1, e_kb2, cmp_dtype=pl.DT_UINT8)
+            e_kb3 = vf.eq(hhi, kb3, pb8)
+            e_kb2 = vf.eq(hlo, kb2, e_kb3)
+            m = vf.eq(lhi, kb1, e_kb2)
             c0 = vf.histograms(llo, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx = vf.xor(llo, x80, pb8)
             c1 = vf.histograms(vx, m, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
@@ -2898,9 +2888,9 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             idx_c = vf.arange(i * 64, dtype=pl.DT_UINT32)
             cout = vf.load_align(hist_t, i * 64)
             pge = vf.ge(cout, btm, pb32)
-            sq = vf.squeeze(idx_c, pge, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT32)
-            vf.store_unalign(sqz_t, sq, al, post_update=True)
-        vf.store_unalign_post(sqz_t, al)
+            sq = vf.squeeze(idx_c, pge, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sqz_t, sq, al)
+        vf.squeeze_store_unalign_post(sqz_t, al)
         vf.mem_bar()
         idx_b = vf.load_align(sqz_t, 0, dist=pl.LoadDist.BRC_B8)
         one = vf.full(0x01010101, dtype=pl.DT_UINT32)
@@ -2961,17 +2951,17 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             gl = vf.gt(lo, lb, pb16)
             t1 = vf.and_(eh, gl, pb16)
             m = vf.or_(gh, t1, pb16)
-            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
+            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
         for w in pl.range(0, nwin):
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
             eh = vf.eq(hi, kb, pb16)
             el = vf.eq(lo, lb, pb16)
             m = vf.and_(eh, el, pb16)
-            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
-        vf.store_unalign_post(dst, ar)
+            sq = vf.squeeze(hi, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
+        vf.squeeze_store_unalign_post(dst, ar)
         vf.mem_bar()
 
     @pl.vector_function
@@ -2989,17 +2979,17 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             gl = vf.gt(lo, lb, pb16)
             t1 = vf.and_(eh, gl, pb16)
             m = vf.or_(gh, t1, pb16)
-            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
+            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
         for w in pl.range(0, nwin):
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
             eh = vf.eq(hi, kb, pb16)
             el = vf.eq(lo, lb, pb16)
             m = vf.and_(eh, el, pb16)
-            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(dst, sq, ar, post_update=True)
-        vf.store_unalign_post(dst, ar)
+            sq = vf.squeeze(lo, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(dst, sq, ar)
+        vf.squeeze_store_unalign_post(dst, ar)
         vf.mem_bar()
 
     @pl.vector_function
@@ -3024,8 +3014,8 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             m = vf.or_(gh, t1, pb16)
             ordinal = vf.arange(w * 128, dtype=pl.DT_UINT16)
             local = vf.sub(ordinal, offset, pb16)
-            packed = vf.squeeze(local, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(sh, packed, ar, post_update=True)
+            packed = vf.squeeze(local, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sh, packed, ar)
         for w in pl.range(0, nwin):
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
@@ -3034,9 +3024,9 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             m = vf.and_(eh, el, pb16)
             ordinal = vf.arange(w * 128, dtype=pl.DT_UINT16)
             local = vf.sub(ordinal, offset, pb16)
-            packed = vf.squeeze(local, m, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_UINT16)
-            vf.store_unalign(sh, packed, ar, post_update=True)
-        vf.store_unalign_post(sh, ar)
+            packed = vf.squeeze(local, m, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(sh, packed, ar)
+        vf.squeeze_store_unalign_post(sh, ar)
         vf.mem_bar()
         # UNPK_B16 loads64 adjacent U16 values into even halfwords and zeroes odd
         # halfwords. Reinterpreting the register yields64 ordered nonnegative I32.
@@ -3078,10 +3068,10 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.load_align(ki + ibase, w * 128)
             ib = vf.load_align(ki + ibase, w * 128 + 64)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
         for w in pl.range(nreg0, nwin):  # raw GT
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
@@ -3098,10 +3088,10 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.arange(base0 + (w - nreg0) * 128, dtype=pl.DT_INT32)
             ib = vf.arange(base0 + (w - nreg0) * 128 + 64, dtype=pl.DT_INT32)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
         for w in pl.range(0, nreg0):  # region0 EQ
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
@@ -3116,10 +3106,10 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.load_align(ki + ibase, w * 128)
             ib = vf.load_align(ki + ibase, w * 128 + 64)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
         for w in pl.range(nreg0, nwin):  # raw EQ
             hi = vf.load_align(kh + base, w * 128)
             lo = vf.load_align(kl + base, w * 128)
@@ -3134,11 +3124,11 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             mb = vf.gt(c1, z32, pu32)
             ia = vf.arange(base0 + (w - nreg0) * 128, dtype=pl.DT_INT32)
             ib = vf.arange(base0 + (w - nreg0) * 128 + 64, dtype=pl.DT_INT32)
-            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sa, ar, post_update=True)
-            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG, dtype=pl.DT_INT32)
-            vf.store_unalign(si, sb, ar, post_update=True)
-        vf.store_unalign_post(si, ar)
+            sa = vf.squeeze(ia, ma, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sa, ar)
+            sb = vf.squeeze(ib, mb, gather_mode=pl.SqueezeMode.STORE_REG)
+            vf.squeeze_store_unalign(si, sb, ar)
+        vf.squeeze_store_unalign_post(si, ar)
         vf.mem_bar()
 
     @pl.vector_function
@@ -3251,15 +3241,15 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             c1_0 = vf.histograms(vx0, pb8, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         tot0 = vf.full(c0_0, pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         c1g0 = vf.add(c1_0, tot0, pb16)
-        ge0_0 = vf.ge(c0_0, rank0, pb16, cmp_dtype=pl.DT_UINT16)
-        ge1_0 = vf.ge(c1g0, rank0, pb16, cmp_dtype=pl.DT_UINT16)
+        ge0_0 = vf.ge(c0_0, rank0, pb16)
+        ge1_0 = vf.ge(c1g0, rank0, pb16)
         e0_0 = vf.select(idx0, sentinel, ge0_0)
         e1_0 = vf.select(idx1, sentinel, ge1_0)
         eligible0 = vf.min(e0_0, e1_0, pb16)
         chosen0 = vf.reduce_min(eligible0, pb16)
         digit0 = vf.full(chosen0, pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        lt0_0 = vf.lt(c0_0, rank0, pb16, cmp_dtype=pl.DT_UINT16)
-        lt1_0 = vf.lt(c1g0, rank0, pb16, cmp_dtype=pl.DT_UINT16)
+        lt0_0 = vf.lt(c0_0, rank0, pb16)
+        lt1_0 = vf.lt(c1g0, rank0, pb16)
         p0_0 = vf.select(c0_0, zero16, lt0_0)
         p1_0 = vf.select(c1g0, zero16, lt1_0)
         below0 = vf.max(p0_0, p1_0, pb16)
@@ -3273,21 +3263,21 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
         c1_1 = vf.full(0, pb16, dtype=pl.DT_UINT16)
         for i1 in pl.range(0, nloads):
             hlo1, hhi1 = vf.load_align(kh + base, i1 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            pm1_0 = vf.eq(hhi1, byte0, pb8, cmp_dtype=pl.DT_UINT8)
+            pm1_0 = vf.eq(hhi1, byte0, pb8)
             c0_1 = vf.histograms(hlo1, pm1_0, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx1 = vf.xor(hlo1, x80, pb8)
             c1_1 = vf.histograms(vx1, pm1_0, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         tot1 = vf.full(c0_1, pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         c1g1 = vf.add(c1_1, tot1, pb16)
-        ge0_1 = vf.ge(c0_1, rank1, pb16, cmp_dtype=pl.DT_UINT16)
-        ge1_1 = vf.ge(c1g1, rank1, pb16, cmp_dtype=pl.DT_UINT16)
+        ge0_1 = vf.ge(c0_1, rank1, pb16)
+        ge1_1 = vf.ge(c1g1, rank1, pb16)
         e0_1 = vf.select(idx0, sentinel, ge0_1)
         e1_1 = vf.select(idx1, sentinel, ge1_1)
         eligible1 = vf.min(e0_1, e1_1, pb16)
         chosen1 = vf.reduce_min(eligible1, pb16)
         digit1 = vf.full(chosen1, pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        lt0_1 = vf.lt(c0_1, rank1, pb16, cmp_dtype=pl.DT_UINT16)
-        lt1_1 = vf.lt(c1g1, rank1, pb16, cmp_dtype=pl.DT_UINT16)
+        lt0_1 = vf.lt(c0_1, rank1, pb16)
+        lt1_1 = vf.lt(c1g1, rank1, pb16)
         p0_1 = vf.select(c0_1, zero16, lt0_1)
         p1_1 = vf.select(c1g1, zero16, lt1_1)
         below1 = vf.max(p0_1, p1_1, pb16)
@@ -3302,22 +3292,22 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
         for i2 in pl.range(0, nloads):
             hlo2, hhi2 = vf.load_align(kh + base, i2 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo2, lhi2 = vf.load_align(kl + base, i2 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            pm2_0 = vf.eq(hhi2, byte0, pb8, cmp_dtype=pl.DT_UINT8)
-            pm2_1 = vf.eq(hlo2, byte1, pm2_0, cmp_dtype=pl.DT_UINT8)
+            pm2_0 = vf.eq(hhi2, byte0, pb8)
+            pm2_1 = vf.eq(hlo2, byte1, pm2_0)
             c0_2 = vf.histograms(lhi2, pm2_1, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx2 = vf.xor(lhi2, x80, pb8)
             c1_2 = vf.histograms(vx2, pm2_1, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         tot2 = vf.full(c0_2, pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         c1g2 = vf.add(c1_2, tot2, pb16)
-        ge0_2 = vf.ge(c0_2, rank2, pb16, cmp_dtype=pl.DT_UINT16)
-        ge1_2 = vf.ge(c1g2, rank2, pb16, cmp_dtype=pl.DT_UINT16)
+        ge0_2 = vf.ge(c0_2, rank2, pb16)
+        ge1_2 = vf.ge(c1g2, rank2, pb16)
         e0_2 = vf.select(idx0, sentinel, ge0_2)
         e1_2 = vf.select(idx1, sentinel, ge1_2)
         eligible2 = vf.min(e0_2, e1_2, pb16)
         chosen2 = vf.reduce_min(eligible2, pb16)
         digit2 = vf.full(chosen2, pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.LOWEST)
-        lt0_2 = vf.lt(c0_2, rank2, pb16, cmp_dtype=pl.DT_UINT16)
-        lt1_2 = vf.lt(c1g2, rank2, pb16, cmp_dtype=pl.DT_UINT16)
+        lt0_2 = vf.lt(c0_2, rank2, pb16)
+        lt1_2 = vf.lt(c1g2, rank2, pb16)
         p0_2 = vf.select(c0_2, zero16, lt0_2)
         p1_2 = vf.select(c1g2, zero16, lt1_2)
         below2 = vf.max(p0_2, p1_2, pb16)
@@ -3332,16 +3322,16 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
         for i3 in pl.range(0, nloads):
             hlo3, hhi3 = vf.load_align(kh + base, i3 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
             llo3, lhi3 = vf.load_align(kl + base, i3 * 256, dist=pl.LoadDist.DINTLV_B8, dtype=pl.DT_UINT8)
-            pm3_0 = vf.eq(hhi3, byte0, pb8, cmp_dtype=pl.DT_UINT8)
-            pm3_1 = vf.eq(hlo3, byte1, pm3_0, cmp_dtype=pl.DT_UINT8)
-            pm3_2 = vf.eq(lhi3, byte2, pm3_1, cmp_dtype=pl.DT_UINT8)
+            pm3_0 = vf.eq(hhi3, byte0, pb8)
+            pm3_1 = vf.eq(hlo3, byte1, pm3_0)
+            pm3_2 = vf.eq(lhi3, byte2, pm3_1)
             c0_3 = vf.histograms(llo3, pm3_2, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
             vx3 = vf.xor(llo3, x80, pb8)
             c1_3 = vf.histograms(vx3, pm3_2, bin_type=pl.BinType.BIN0, hist_type=pl.HistType.ACCUMULATE)
         tot3 = vf.full(c0_3, pb16, dtype=pl.DT_UINT16, pos=pl.DuplicatePos.HIGHEST)
         c1g3 = vf.add(c1_3, tot3, pb16)
-        ge0_3 = vf.ge(c0_3, rank3, pb16, cmp_dtype=pl.DT_UINT16)
-        ge1_3 = vf.ge(c1g3, rank3, pb16, cmp_dtype=pl.DT_UINT16)
+        ge0_3 = vf.ge(c0_3, rank3, pb16)
+        ge1_3 = vf.ge(c1g3, rank3, pb16)
         e0_3 = vf.select(idx0, sentinel, ge0_3)
         e1_3 = vf.select(idx1, sentinel, ge1_3)
         eligible3 = vf.min(e0_3, e1_3, pb16)
@@ -3401,16 +3391,10 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
         scr_hi_db,
         scr_lo_db,
         scr_idx_db,
-        hist_t,
-        sqz_t,
-        kb3_t,
-        kb2_t,
-        kb1_t,
-        kb0_t,
-        nextk_t,
-        kth_hi_t,
-        kth_lo_t,
+        scratch,
     ):
+        # Tuple forwarding keeps scratch tiles out of the scalar pipeline context.
+        hist_t, sqz_t, kb3_t, kb2_t, kb1_t, kb0_t, nextk_t, kth_hi_t, kth_lo_t = scratch
         sv = score_db.next()  # unconditional rotation every tick
         # BP-7 touch DELETED, and in this file qk_touch_db is not declared at all: the
         # Module-2 block below passes `sv` bare and positional to _vf_score_keys, which is
@@ -3462,6 +3446,9 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
                 if gk == first:  # weights: MTE2 once per grid block
                     pl.set_validshape(wt, [rows2, WCOL])
                     pl.load(wt, w2d, [r0 + r_lo2, 0])
+                    # Masked rows may not consume W on V; fence before its next reuse.
+                    pl.system.mutex_lock(pipe=pl.PipeType.V, mutex_id=10)
+                    pl.system.mutex_unlock(pipe=pl.PipeType.V, mutex_id=10)
                 kh = key_hi_db.current()
                 kl = key_lo_db.current()
                 pl.set_validshape(kh, [RPA, CAP])  # widen back before the VF writes; the
@@ -3973,6 +3960,7 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
             kth_lo_t = pl.make_tile(
                 pl.TileType(shape=[1, 64], dtype=pl.DT_UINT32, target_memory=pl.MemorySpace.Vec), addr=VA_KTLO
             )
+            scratch = (hist_t, sqz_t, kb3_t, kb2_t, kb1_t, kb0_t, nextk_t, kth_hi_t, kth_lo_t)
 
         # (4) the single pipeline loop: one cube stage block + one vector stage block
         n_blk = pl.max(1, (nb_grid + num_cores - 1) // num_cores)
@@ -4104,15 +4092,7 @@ def _make_li_pro_kernel_short(n1, topk, spread=0):
                         scr_hi_db,
                         scr_lo_db,
                         scr_idx_db,
-                        hist_t,
-                        sqz_t,
-                        kb3_t,
-                        kb2_t,
-                        kb1_t,
-                        kb0_t,
-                        nextk_t,
-                        kth_hi_t,
-                        kth_lo_t,
+                        scratch,
                     )
         # Write a contiguous trivial prefix when the block is within one
         # segment; crossing blocks use the original per-row device predicate.
@@ -4326,6 +4306,24 @@ def _get_trivial_kernel(n1, topk):
     return trivial_kernel
 
 
+def _selected_scores(query, key, weights, indices, cu_q, cu_k):
+    """FP32 scores in the selected order, without materializing dense T1-by-T2 logits."""
+    scores = torch.empty(indices.shape, device=query.device, dtype=torch.float32)
+    rows = torch.arange(query.shape[0], device=query.device, dtype=cu_q.dtype)
+    batch = torch.searchsorted(cu_q[1:], rows, right=True).clamp_max(cu_q.numel() - 2)
+    local = indices[:, 0]
+    global_keys = (local.clamp_min(0) + cu_k[batch, None]).clamp_max(key.shape[0] - 1)
+    invalid = local < 0
+    # Bound temporary gathered keys independently of the sequence length.
+    for start in range(0, query.shape[0], 32):
+        stop = min(start + 32, query.shape[0])
+        selected = key[global_keys[start:stop], 0].float()
+        logits = torch.bmm(query[start:stop].float(), selected.transpose(1, 2))
+        values = (logits.clamp_min_(0) * weights[start:stop, :, None]).sum(dim=1)
+        scores[start:stop, 0] = values.masked_fill_(invalid[start:stop], -torch.inf)
+    return scores
+
+
 def lightning_indexer_pro(
     query,
     key,
@@ -4346,7 +4344,11 @@ def lightning_indexer_pro(
     cmp_ratio=4,
     return_value=1,
 ):
-    """Return the public (sparse_indices, empty sparse_values) pair."""
+    """Return indices and optional FP32 scores. Ties repeat within the same environment.
+
+    Both deterministic modes use the same fixed-order selection kernel. No
+    cross-version tie order or lowest-index tie rule is promised.
+    """
     if seqused_q is not None:
         raise ValueError("seqused_q must be None")
     if seqused_k is not None:
@@ -4422,4 +4424,6 @@ def lightning_indexer_pro(
         kernel = _get_trivial_kernel(n1, topk)
         block_dim = min(int(get_platform_info().vector_core_num), (t1 + 15) // 16)
     kernel[None, block_dim](query, key, cu_seqlens_q, cu_seqlens_k, cmp_residual_k, weights, sparse_indices)
+    if return_value:
+        sparse_values = _selected_scores(query, key, weights, sparse_indices, cu_seqlens_q, cu_seqlens_k)
     return sparse_indices, sparse_values

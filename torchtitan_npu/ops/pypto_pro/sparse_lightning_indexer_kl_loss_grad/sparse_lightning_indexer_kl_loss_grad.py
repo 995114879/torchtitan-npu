@@ -16,13 +16,9 @@ Ported from pypto-gym commit 7ce340d64f46c0ef1025772ffb72abb5ca2be232,
 custom/frozen_li_lig_20261018_v1. Kernel arithmetic and synchronization are
 retained; development-only platform/build inspection helpers are excluded.
 
-The qualified runtime is cann/pypto commit
-e28aca0837d642333ad8b9fffc1b1e379fab9b1a. Its ``pypto`` distribution provides
-the ``pypto_pro`` import package; ``pypto==0.2.1`` alone does not identify this
-ABI. Build from that revision with ``build_ci.py`` following its
-``docs/zh/install/build_and_install.md``, then install the matching package in
-the active Python environment. Mismatch errors include the fixed-revision
-build guide and the loaded JIT path to identify packages shadowed by CANN.
+Current PyPTO owns the mixed SIMT launch ABI. The legacy ABI shim below is
+restricted to its pinned runtime; it does not certify determinism on that
+runtime.
 """
 
 import hashlib
@@ -65,6 +61,9 @@ def install_simt_launch():
     that has not been verified. Unrelated kernels delegate to the original JIT.
     """
     jit = importlib.import_module("pypto_pro.runtime.jit")
+    # Recent runtimes own dynamic UB allocation and the mixed SIMT launch ABI.
+    if "required_dynamic_ub_size" in inspect.signature(jit._generate_caller_cpp).parameters:
+        return
     lock = jit.__dict__.setdefault(_LOCK_KEY, threading.RLock())
     with lock:
         previous = getattr(jit, _STATE_KEY, None)
@@ -208,6 +207,8 @@ install_simt_launch()
 import pypto_pro.language as pl  # pyrefly: ignore [missing-import]
 from pypto_pro.language import Vf as vf  # noqa: N813  # pyrefly: ignore [missing-import]
 from pypto_pro.runtime.tilingkey import TilingKeyField  # pyrefly: ignore [missing-import]
+
+_SIMT_ATOMIC_OFFSET_API = "offset" in inspect.signature(pl.simt.atomic_add).parameters
 
 try:  # delivery-safe: NPU runtime is optional
     import torch_npu  # noqa: F401
@@ -624,10 +625,11 @@ _GATE_CACHE = {}
 # =====================================================================================
 class KlgTilingKey:
     MaskMode = TilingKeyField(bits=1, values=[0, 3])
+    Deterministic = TilingKeyField(bits=1, values=[0, 1])
 
     def is_valid(self, key):
-        (mask_mode,) = key
-        return mask_mode in MASK_MODES
+        mask_mode, deterministic = key
+        return mask_mode in MASK_MODES and deterministic in (0, 1)
 
 
 # =====================================================================================
@@ -756,7 +758,7 @@ def klg_zero_key_row_vf(kk_tile, off):
     vf.store_align(kk_tile + off, zero, preg)
 
 
-@pl.simt.function(max_threads=1024)
+@pl.vector_function(mode="simt", max_threads=1024)
 def klg_simt_dk_atomic(
     values, indices, output, base: pl.DT_INT32, real_k: pl.DT_INT32, lim: pl.DT_INT32, ks: pl.DT_INT32
 ):
@@ -775,7 +777,31 @@ def klg_simt_dk_atomic(
         if base + s < real_k:
             si = indices[0, s]
             if si >= 0 and si < lim:
-                pl.simt.atomic_add(output[ks + si, 0, d], values[s, d])
+                if _SIMT_ATOMIC_OFFSET_API:
+                    pl.simt.atomic_add(output, [ks + si, 0, d], values[s, d])
+                else:
+                    pl.simt.atomic_add(output[ks + si, 0, d], values[s, d])
+
+
+@pl.vector_function(mode="simt", max_threads=1024)
+def klg_simt_dk_contribution(
+    values,
+    indices,
+    output,
+    base: pl.DT_INT32,  # pyrefly: ignore [not-a-type]
+    real_k: pl.DT_INT32,  # pyrefly: ignore [not-a-type]
+    lim: pl.DT_INT32,  # pyrefly: ignore [not-a-type]
+    row: pl.DT_INT32,  # pyrefly: ignore [not-a-type]
+):
+    tid = pl.simt.linear_thread_idx()
+    for i in pl.range(0, TS * D // 1024):
+        off = tid + i * 1024
+        s = off // D
+        d = off % D
+        if base + s < real_k:
+            si = indices[0, s]
+            if si >= 0 and si < lim:
+                output[row + base + s, 0, d] = values[s, d]
 
 
 @pl.vector_function
@@ -1505,7 +1531,10 @@ def sparse_li_klgrad_pro_kernel_opt20261013finaldwds_public(
         workers0 = pl.get_block_num() * pl.get_subblock_num()
         zrow = zero_g.current()
         klg_wide_zero_vf(zrow, DROW_REGS)  # [1, D] fp32 = 2 whole registers, offsets r*64
-        for gz in pl.range(worker0, t2, workers0):
+        zero_rows = t2
+        if Deterministic:  # pyrefly: ignore [unknown-name]
+            zero_rows = 0  # Contributions were zeroed on the current stream by the wrapper.
+        for gz in pl.range(worker0, zero_rows, workers0):
             pl.store(dk_out, zrow, [gz, 0, 0], order=[0, 2])
         pl.system.set_cross_core(pipe=pl.PipeType.MTE3, event_id=EV_DK_ZERO, sync_mode=pl.CrossCoreSyncMode.INTER_BLOCK)
         pl.system.wait_cross_core(
@@ -3056,11 +3085,12 @@ def sparse_li_klgrad_pro_kernel_opt20261013finaldwds_public(
                                 pl.load(si_out, sparse_indices, [pl.min(v5_t, t1 - 1), 0, v5_base], order=[0, 2])
                                 # Complete N1 reductions remain in the original FP32 Cube tile.
                                 # SIMT runs on V after B4.READY and before the original B4.RELEASE.
-                                pl.simt.launch(
-                                    klg_simt_dk_atomic,
-                                    threads=1024,
-                                    args=(dkg_v, si_out, dk_out, v5_base, v5_rk, v5_lim, v5_ks),
-                                )
+                                if Deterministic:  # pyrefly: ignore [unknown-name]
+                                    klg_simt_dk_contribution[1024](
+                                        dkg_v, si_out, dk_out, v5_base, v5_rk, v5_lim, v5_t * kmax
+                                    )
+                                else:
+                                    klg_simt_dk_atomic[1024](dkg_v, si_out, dk_out, v5_base, v5_rk, v5_lim, v5_ks)
 
                                 # V27: the token's last pass-1 task casts dq_row to bf16 and writes it
                                 # out in two [32, D] halves.  SPEC section 12 A8 requires ties-to-even,
@@ -3129,6 +3159,30 @@ def _require_dense(name, tensor, ndim, dtype):
     return shape
 
 
+_DETERMINISTIC_QUERY_CHUNK = 256
+
+
+def _deterministic_key_indices(indices, cu_q, cu_k, residual, t2, mask_mode, cmp_ratio):
+    """Map fixed (query, slot) order to global keys; invalid slots use sentinel T2."""
+    t1, _, topk = indices.shape
+    rows = torch.arange(t1, device=indices.device, dtype=torch.int32)
+    batch = torch.searchsorted(cu_q[1:], rows, right=True).clamp_max(cu_q.numel() - 2)
+    q_start, q_end = cu_q[batch], cu_q[batch + 1]
+    k_start, k_end = cu_k[batch], cu_k[batch + 1]
+    available = k_end - k_start
+    real_k = available
+    if mask_mode == 3:
+        available = torch.minimum(available + 1, t2 - k_start)
+        visible = (k_end - k_start) * cmp_ratio + residual[batch] - (q_end - q_start) + rows - q_start + 1
+        real_k = torch.minimum(visible.clamp_min(0) // cmp_ratio, available)
+    local = indices[:, 0, :]
+    valid = (rows >= q_start) & (rows < q_end)
+    valid = valid[:, None] & (torch.arange(topk, device=indices.device) < real_k[:, None])
+    valid = valid & (local >= 0) & (local < available[:, None])
+    global_keys = local.masked_fill(~valid, 0) + k_start[:, None]
+    return global_keys.masked_fill_(~valid, t2).reshape(-1)
+
+
 def sparse_li_klgrad_pro(
     query=None,
     key=None,
@@ -3152,7 +3206,12 @@ def sparse_li_klgrad_pro(
     k=None,
     w=None,
 ):
-    """Public LI gradient ABI; every calculation and output initialization is in one kernel."""
+    """Public LI gradient ABI, with optional fixed-order FP32 dK reduction.
+
+    Ordinary mode retains the kernel's atomic dK store. Deterministic mode
+    emits contributions in fixed query chunks, then uses deterministic index_put_.
+    dK remains FP32, as in the existing Pro interface.
+    """
     if q is not None:
         if query is not None:
             raise TypeError("query and q cannot both be supplied")
@@ -3242,10 +3301,54 @@ def sparse_li_klgrad_pro(
     #       what probe_klg_m5_constructs.py's NaN pre-fill was built to catch.
     #   dw, softmax_out  written whole, once per token -> torch.empty
     dq_out = torch.empty((t1, N1, D), dtype=torch.bfloat16, device=dev)
-    dk_out = torch.empty((t2, 1, D), dtype=torch.float32, device=dev)
     dw_out = torch.empty((t1, N1), dtype=torch.float32, device=dev)
     softmax_out = torch.empty((t1, 1, kmax), dtype=torch.float32, device=dev)
-    sparse_li_klgrad_pro_kernel_opt20261013finaldwds_public[None, block_dim, {"MaskMode": int(mask_mode)}](
+    # Read on every invocation, including warn_only; never cache this global state.
+    if torch.are_deterministic_algorithms_enabled():
+        chunk_rows = min(t1, _DETERMINISTIC_QUERY_CHUNK)
+        required_bytes = chunk_rows * kmax * (D * 4 + 4 + 8) + (t2 + 1) * D * 4
+        try:
+            dk_out = torch.empty((chunk_rows * kmax, 1, D), dtype=torch.float32, device=dev)
+            kernel = sparse_li_klgrad_pro_kernel_opt20261013finaldwds_public[  # pyrefly: ignore [unsupported-operation]
+                None, block_dim, {"MaskMode": int(mask_mode), "Deterministic": 1}
+            ]
+            reduced = torch.zeros((t2 + 1, 1, D), dtype=torch.float32, device=dev)
+            for start in range(0, t1, chunk_rows):
+                stop = min(start + chunk_rows, t1)
+                chunk_indices = sparse_indices[start:stop]  # pyrefly: ignore [unsupported-operation]
+                # Shift, do not clip: preserve sequence lengths and causal positions.
+                chunk_cu_q = cu_seqlens_q - start  # pyrefly: ignore [unsupported-operation]
+                dk_out.zero_()
+                kernel(
+                    query[start:stop],  # pyrefly: ignore [unsupported-operation]
+                    key,
+                    weights[start:stop],  # pyrefly: ignore [unsupported-operation]
+                    chunk_indices,
+                    attn_softmax_l1_norm[start:stop],  # pyrefly: ignore [unsupported-operation]
+                    chunk_cu_q,
+                    cu_seqlens_k,
+                    cmp_residual_k,
+                    dq_out[start:stop],
+                    dk_out,
+                    dw_out[start:stop],
+                    softmax_out[start:stop],
+                    int(cmp_ratio),
+                )
+                indices = _deterministic_key_indices(
+                    chunk_indices, chunk_cu_q, cu_seqlens_k, cmp_residual_k, t2, int(mask_mode), int(cmp_ratio)
+                ).to(torch.int64)
+                # Avoid index_add_'s alpha=1 multiply and contribution-sized temporary.
+                reduced.index_put_((indices,), dk_out[: (stop - start) * kmax], accumulate=True)
+            return (dq_out, reduced[:t2], dw_out, softmax_out)
+        except RuntimeError as error:
+            raise RuntimeError(
+                f"LIG deterministic dK requires at least {required_bytes} workspace bytes; "
+                "index_put_ may require additional runtime workspace. No atomic fallback was used."
+            ) from error
+    dk_out = torch.empty((t2, 1, D), dtype=torch.float32, device=dev)
+    sparse_li_klgrad_pro_kernel_opt20261013finaldwds_public[
+        None, block_dim, {"MaskMode": int(mask_mode), "Deterministic": 0}
+    ](
         query,
         key,
         weights,
