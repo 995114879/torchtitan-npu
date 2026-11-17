@@ -152,7 +152,9 @@ def _lora_config(ao, kind):
 
 
 def _block_fp8_policy(ao):
-    return ao.ParamSwapConfig(weight_config=ao.BlockMXQuantizeConfig(), activation_config=ao.MXQuantizeConfig())
+    from torchao_npu.configs import ParamSwapConfig
+
+    return ParamSwapConfig(weight_config=ao.BlockMXQuantizeConfig(), activation_config=ao.MXQuantizeConfig())
 
 
 def _convert(ao, config, policy=None):
