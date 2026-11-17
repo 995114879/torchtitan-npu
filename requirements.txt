@@ -11,6 +11,8 @@ torchtitan==0.3.0
 attn-gym==0.0.16
 pybind11==3.0.4
 numpy
+# PyArrow 26 requires NumPy 2; Triton-Ascend 3.2.1 requires NumPy 1.26.4.
+pyarrow<26
 PyYAML
 ninja
 --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
