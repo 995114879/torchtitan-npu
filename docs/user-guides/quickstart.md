@@ -45,7 +45,7 @@ DeepSeek V3 单卡训练任务可直接使用 `scripts/run_train.sh` 启动。`s
 
 ### 单卡训练任务
 
-使用默认配置启动训练：
+以下示例在默认配置上显式启用实数 RoPE 兼容实现，避免对复数 RoPE cache 进行位置索引：
 
 ```bash
 NGPU=1 \
@@ -55,8 +55,11 @@ bash scripts/run_train.sh \
   --dataloader.dataset-path tests/assets/c4_test \
   --training.local-batch-size 1 \
   --training.seq-len 2048 \
-  --training.steps 5
+  --training.steps 5 \
+  --override.imports torchtitan_npu.override.common.rope.workaround
 ```
+
+该 override 使用预展开的实数 cos/sin cache 和 PyTorch 算子完成 RoPE，适用于复数位置索引受限的 NPU 环境。它与 `torchtitan_npu.override.common.rope.asc_complex` 不能同时启用；切换到其他模型或已有 override 组合时，需先核对匹配的配置类型与冲突条件，见 [RoPE override 说明](../../torchtitan_npu/override/README.md#common)。
 
 > [!NOTE]
 > 通用 launcher 配置项说明：
