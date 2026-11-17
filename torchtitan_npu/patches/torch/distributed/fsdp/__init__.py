@@ -26,12 +26,13 @@ https://github.com/pytorch/pytorch/issues/202040, with the same relaxation
 proposed in https://github.com/pytorch/pytorch/pull/202101.  Retire this patch
 once a released torch carries the fix.
 
-Optional AG compute-stream allocation adapts the pinned FSDP communication
-interfaces to NPU stream-local memory reuse. This module owns allocation,
-copy-out and cleanup together; the upstream issues above concern precision
-and input validation, not this allocation policy. AG results retain the native
-ownership protocol and return side-stream usage before storage can be reused.
-The option is disabled by default and read once at import time. Backend
+Optional AG/RS compute-stream allocation adapts the pinned FSDP communication
+interfaces to NPU stream-local memory reuse. AG enables native asynchronous
+unshard, moving allocation, cast and copy-in to the current stream; configure
+explicit forward prefetching to overlap communication with compute. This is
+the mechanism exposed by upstream pytorch/pytorch#202343. RS redirects its
+output allocation and retains native communication streams.
+Both options are disabled by default and read once at import time. Backend
 requirements and supported paths are documented in
 ``docs/feature_guides/fsdp_compute_stream_allocation.md``.
 """
@@ -59,61 +60,46 @@ if TYPE_CHECKING:
 _ORIGINAL_POLICY_INIT = MixedPrecisionPolicy.__init__
 _ORIGINAL_INIT_DTYPE_ATTRS = FSDPParam.init_dtype_attrs
 _ORIGINAL_FOREACH_REDUCE = _fsdp_collectives.foreach_reduce
-_ORIGINAL_FOREACH_ALL_GATHER = _fsdp_collectives.foreach_all_gather
-_ORIGINAL_FOREACH_ALL_GATHER_COPY_OUT = _fsdp_collectives.foreach_all_gather_copy_out
-_ORIGINAL_FINALIZE_BACKWARD = _fsdp_param_group.FSDPParamGroup.finalize_backward
-_ORIGINAL_RESET_ITER_STATE = _fsdp_param_group.FSDPParamGroup._reset_iter_state
+_ORIGINAL_PARAM_GROUP_INIT = _fsdp_param_group.FSDPParamGroup.__init__
 _ORIGINAL_ALL_GATHER_INPUTS = FSDPParam.all_gather_inputs
 # ``property.fget`` is statically ``Callable | None``; this named property has a getter.
 _ORIGINAL_ALL_GATHER_INPUTS_FGET = cast("Callable[[FSDPParam], Any]", _ORIGINAL_ALL_GATHER_INPUTS.fget)
-_FOREACH_ALL_GATHER_SIGNATURE = inspect.signature(_ORIGINAL_FOREACH_ALL_GATHER)
+_FOREACH_REDUCE_SIGNATURE = inspect.signature(_ORIGINAL_FOREACH_REDUCE)
+_RS_ALLOC_ON_COMPUTE_STREAM = os.getenv("TORCHTITAN_NPU_FSDP_RS_ALLOC_ON_COMPUTE_STREAM", "0") == "1"
 _AG_ALLOC_ON_COMPUTE_STREAM = os.getenv("TORCHTITAN_NPU_FSDP_AG_ALLOC_ON_COMPUTE_STREAM", "0") == "1"
 
 
 class _ComputeStreamAllocator:
     """Allocate on compute; preserve native copy and communication streams."""
 
-    def __init__(self, comm, device_handle):
+    def __init__(self, comm, device_handle, extra_streams=()):
         self._comm = comm
         self._device_handle = device_handle
         self._compute_stream = device_handle.current_stream()
-        self._all_gather_output = None
+        self._extra_streams = extra_streams
 
     def allocate(self, size, *, dtype, device):
         caller = self._device_handle.current_stream()
         with self._device_handle.stream(self._compute_stream):
             output = self._comm.allocate(size, dtype=dtype, device=device)
-            # Keep storage alive until the native result takes ownership.
-            self._all_gather_output = output
         if caller != self._compute_stream:
             # Order recycled storage and allocation work before side-stream use.
             caller.wait_stream(self._compute_stream)
+            output.record_stream(caller)
+            for stream in self._extra_streams:
+                if stream is not None and stream != self._compute_stream and stream != caller:
+                    output.record_stream(stream)
         return output
 
     def __call__(self, *args, **kwargs):
         return self._comm(*args, **kwargs)
 
 
-class _ComputeStreamAllGatherResult(_fsdp_collectives.AllGatherResult):
-    """Preserve the native six-field result and its existing keepalive lifetime."""
-
-    _compute_stream: torch.Stream
-    _side_streams: tuple[torch.Stream, ...]
-
-    def _record_side_streams(self, *streams):
-        for stream in (*self._side_streams, *streams):
-            if stream != self._compute_stream:
-                self.all_gather_output.record_stream(stream)
-
-    def _wait_on_compute_stream(self):
-        # Unconsumed prefetch: return all side-stream usage before native cleanup
-        # drops the result. Async Work may cover an internal HCCL stream too.
-        handle = torch.get_device_module(self.all_gather_output.device)
-        with handle.stream(self._compute_stream):
-            if self.all_gather_event is not None:
-                self._compute_stream.wait_event(self.all_gather_event)
-            if self.all_gather_work is not None:
-                self.all_gather_work.wait()
+@wraps(_ORIGINAL_PARAM_GROUP_INIT)
+def _patched_param_group_init(self, *args, **kwargs):
+    _ORIGINAL_PARAM_GROUP_INIT(self, *args, **kwargs)
+    # Same native mode as FSDPModule._set_unshard_async_op(True), for every group.
+    self.unshard_async_op = True
 
 
 @contextmanager
@@ -159,68 +145,30 @@ def _patched_foreach_reduce(fsdp_params, unsharded_grads, *args, **kwargs):
     reduce_dtype = fsdp_params[0].reduce_dtype
     if reduce_dtype is not None and len({grad.dtype for grad in unsharded_grads}) > 1:
         unsharded_grads[:] = [grad if grad.dtype == reduce_dtype else grad.to(reduce_dtype) for grad in unsharded_grads]
+    if _RS_ALLOC_ON_COMPUTE_STREAM:
+        bound = _FOREACH_REDUCE_SIGNATURE.bind(fsdp_params, unsharded_grads, *args, **kwargs)
+        values = bound.arguments
+        group = values["reduce_scatter_group"]
+        if (
+            (group is None or group.size() == 1)
+            and values["all_reduce_group"] is None
+            and values["gradient_divide_factor"] == 1.0
+        ):
+            # No collective needs SUM scaling; avoid the native divide-by-one temporary.
+            values["gradient_divide_factor"] = None
+        uses_all_reduce_stream = (
+            bool(values["all_reduce_grads"])
+            if values["all_reduce_group"] is not None
+            else values["all_reduce_hook"] is not None
+        )
+        extra_streams = (values["all_reduce_stream"],) if uses_all_reduce_stream else ()
+        values["reduce_scatter_comm"] = _ComputeStreamAllocator(
+            values["reduce_scatter_comm"],
+            torch.get_device_module(values["device"]),
+            extra_streams,
+        )
+        return _ORIGINAL_FOREACH_REDUCE(*bound.args, **bound.kwargs)
     return _ORIGINAL_FOREACH_REDUCE(fsdp_params, unsharded_grads, *args, **kwargs)
-
-
-@wraps(_ORIGINAL_FOREACH_ALL_GATHER)
-def _patched_foreach_all_gather(fsdp_params, *args, **kwargs):
-    if not _AG_ALLOC_ON_COMPUTE_STREAM:
-        return _ORIGINAL_FOREACH_ALL_GATHER(fsdp_params, *args, **kwargs)
-    bound = _FOREACH_ALL_GATHER_SIGNATURE.bind(fsdp_params, *args, **kwargs)
-    values = bound.arguments
-    allocator = _ComputeStreamAllocator(
-        values["all_gather_comm"],
-        torch.get_device_module(values["device"]),
-    )
-    values["all_gather_comm"] = allocator
-    try:
-        native_result = _ORIGINAL_FOREACH_ALL_GATHER(*bound.args, **bound.kwargs)
-        if native_result is None:
-            raise RuntimeError("Expected a native all-gather result")
-        result = _ComputeStreamAllGatherResult(*native_result)
-        result._compute_stream = allocator._compute_stream
-        result._side_streams = (values["all_gather_copy_in_stream"], values["all_gather_stream"])
-        allocator._all_gather_output = None
-        return result
-    except BaseException:
-        # A failure before Result construction must still protect queued work.
-        if allocator._all_gather_output is not None:
-            for stream in (values["all_gather_copy_in_stream"], values["all_gather_stream"]):
-                if stream != allocator._compute_stream:
-                    allocator._all_gather_output.record_stream(stream)
-        raise
-
-
-@wraps(_ORIGINAL_FOREACH_ALL_GATHER_COPY_OUT)
-def _patched_foreach_all_gather_copy_out(all_gather_result, *args, **kwargs):
-    if not isinstance(all_gather_result, _ComputeStreamAllGatherResult):
-        return _ORIGINAL_FOREACH_ALL_GATHER_COPY_OUT(all_gather_result, *args, **kwargs)
-    handle = torch.get_device_module(all_gather_result.all_gather_output.device)
-    consumer = handle.current_stream()
-    try:
-        output = _ORIGINAL_FOREACH_ALL_GATHER_COPY_OUT(all_gather_result, *args, **kwargs)
-        # Native copy-out already waits for AG and reads on the compute stream.
-        # Only a different consumer needs to return its final read to the owner.
-        if consumer != all_gather_result._compute_stream:
-            all_gather_result._compute_stream.wait_event(consumer.record_event())
-        return output
-    except BaseException:
-        all_gather_result._record_side_streams(consumer)
-        raise
-
-
-@wraps(_ORIGINAL_FINALIZE_BACKWARD)
-def _patched_finalize_backward(self):
-    if isinstance(self._all_gather_result, _ComputeStreamAllGatherResult):
-        self._all_gather_result._wait_on_compute_stream()
-    return _ORIGINAL_FINALIZE_BACKWARD(self)
-
-
-@wraps(_ORIGINAL_RESET_ITER_STATE)
-def _patched_reset_iter_state(self):
-    if isinstance(self._all_gather_result, _ComputeStreamAllGatherResult):
-        self._all_gather_result._wait_on_compute_stream()
-    return _ORIGINAL_RESET_ITER_STATE(self)
 
 
 def _check_all_gather_inputs(fsdp_param: FSDPParam, all_gather_inputs) -> None:
@@ -305,12 +253,9 @@ def apply() -> None:
     # so both references must be patched.
     _fsdp_collectives.foreach_reduce = _patched_foreach_reduce
     _fsdp_param_group.foreach_reduce = _patched_foreach_reduce
-    _fsdp_collectives.foreach_all_gather = _patched_foreach_all_gather
-    _fsdp_param_group.foreach_all_gather = _patched_foreach_all_gather
-    _fsdp_collectives.foreach_all_gather_copy_out = _patched_foreach_all_gather_copy_out
-    _fsdp_param_group.foreach_all_gather_copy_out = _patched_foreach_all_gather_copy_out
-    _fsdp_param_group.FSDPParamGroup.finalize_backward = _patched_finalize_backward
-    _fsdp_param_group.FSDPParamGroup._reset_iter_state = _patched_reset_iter_state
+    torch.distributed.fsdp._fully_shard._fsdp_param_group.FSDPParamGroup.__init__ = (
+        _patched_param_group_init if _AG_ALLOC_ON_COMPUTE_STREAM else _ORIGINAL_PARAM_GROUP_INIT
+    )
     FSDPParam.all_gather_inputs = property(_patched_all_gather_inputs)
 
 
