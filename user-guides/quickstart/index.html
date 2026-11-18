@@ -284,7 +284,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 <tr>
 <td><code>all-to-all-quant-format</code></td>
 <td><code>--all-to-all-quant-format mxfp8</code></td>
-<td>默认未设置。指定 <code>mxfp8</code> 时，对标准 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，不支持 DeepEP。开启示例及限制见<a href="../../feature_guides/low_precision_training/#moe-all-to-all-低精度通信">MoE all-to-all 低精度通信</a>。</td>
+<td>默认未设置。指定 <code>mxfp8</code> 时，对 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，支持 DeepEP 和 standard 两种通信方式，启用该配置时自动跟随高精度的通信方式。开启示例及限制见<a href="../../feature_guides/low_precision_training/#moe-all-to-all-低精度通信">MoE all-to-all 低精度通信</a>。</td>
 </tr>
 <tr>
 <td><code>enable-mxfp4-qat</code></td>
@@ -329,7 +329,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 <code>enable-sparse-attention-quantization</code> 启用 KV source Compressor 与稀疏 attention 量化。
 稀疏 attention 量化可单独启用；启用 Lightning Indexer 量化时必须同时启用稀疏 attention
 量化。标准 A5 融合路径提供 BF16 fallback，<code>USE_GOLDEN=1</code> 不提供这些 fallback。启动日志中出现
-<code>Applied TorchAO-NPU recipe=...</code> 表示 recipe 已应用。</p>
+<code>Applied TorchAO-NPU quantization summary: {...}</code> 表示 recipe 已应用（<code>recipe</code> 字段为实际 recipe）。</p>
 <p>DeepSeek-V4.1 模型做 Block FP8 低精度预训练可运行以下脚本：</p>
 <pre><code class="language-bash">HF_ASSETS_PATH=/path/to/DeepSeek-V41_tokenizer \
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh
