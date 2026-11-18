@@ -608,9 +608,11 @@ def test_build_fqn_to_config_record_survives_real_torchao_encoder(export, tmp_pa
         "    import torchao.core.config\n"
         "    import torchao_npu.configs.param_swap as ps\n"
         "    import torchao_npu.quantization.quant_configs as qc\n"
-        "except Exception as exc:\n"
+        "except ModuleNotFoundError as exc:\n"
+        "    if exc.name not in {'torchao', 'torchao_npu'}:\n"
+        "        raise\n"
         "    print('SKIP', exc)\n"
-        "    sys.exit(0)\n"
+        "    sys.exit(77)\n"
         f"spec = importlib.util.spec_from_file_location('export_mod', {str(export.__file__)!r})\n"
         "mod = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(mod)\n"
@@ -624,11 +626,12 @@ def test_build_fqn_to_config_record_survives_real_torchao_encoder(export, tmp_pa
         "json.dumps(record)\n"
         "print('OK')\n"
     )
-    proc = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=600)
-    if proc.stdout.startswith("SKIP"):
-        pytest.skip("real torchao stack unavailable")
+    env = dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0")
+    proc = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, env=env, timeout=600)
+    if proc.returncode == 77:
+        pytest.skip(proc.stdout.strip())
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert proc.stdout.strip() == "OK"
+    assert proc.stdout.strip().splitlines()[-1:] == ["OK"], proc.stdout
 
 
 def test_inject_torchao_quant_config_writes_fqn_plan(export, tmp_path):
@@ -1292,7 +1295,7 @@ def test_extract_wrapper_configs_recovers_embedded_configs(tmp_path):
     """A real wrapper DCP round-trips through ``extract_wrapper_configs`` (fresh subprocess:
     the real stack self-registers safe globals); plain streams yield nothing.
 
-    Skips where ``torchao_npu`` is unimportable.
+    Skips only when an optional TorchAO package is absent, not when its import fails.
     """
     dqc = _load_module("dcp_quant_configs_under_test", _DCP_MODULE)
     with pytest.raises(ValueError, match="not a DCP checkpoint directory"):
@@ -1307,9 +1310,11 @@ def test_extract_wrapper_configs_recovers_embedded_configs(tmp_path):
         "    import torch.distributed.checkpoint as dcp\n"
         "    from torchao_npu.quantization.quant_configs import MXQuantizeConfig\n"
         "    from torchao_npu.wrapper_tensors.mx_wrapper_tensor import MXTrainingWeightWrapperTensor\n"
-        "except Exception as exc:\n"
+        "except ModuleNotFoundError as exc:\n"
+        "    if exc.name not in {'torchao', 'torchao_npu'}:\n"
+        "        raise\n"
         "    print('SKIP', exc)\n"
-        "    sys.exit(0)\n"
+        "    sys.exit(77)\n"
         "from torchao_npu.quantization.transform import _PARAM_SWAP_QUANTIZE_CONFIG_HANDLER\n"
         "assert MXQuantizeConfig in _PARAM_SWAP_QUANTIZE_CONFIG_HANDLER, 'swap registry not populated'\n"
         f"spec = importlib.util.spec_from_file_location('dqc', {str(_DCP_MODULE)!r})\n"
@@ -1341,10 +1346,10 @@ def test_extract_wrapper_configs_recovers_embedded_configs(tmp_path):
     )
     # ``torchao_npu`` import pulls in torch_npu, whose JIT build log pollutes
     # stdout; scan the tail line for the token instead of comparing verbatim.
-    if proc.stdout.startswith("SKIP"):
-        pytest.skip("real torchao stack unavailable")
+    if proc.returncode == 77:
+        pytest.skip(proc.stdout.strip())
     assert proc.returncode == 0, proc.stderr[-2000:]
-    assert proc.stdout.strip().splitlines()[-1] == "OK", proc.stdout
+    assert proc.stdout.strip().splitlines()[-1:] == ["OK"], proc.stdout
 
 
 def test_extract_wrapper_configs_warns_on_configless_wrapper_streams(tmp_path, caplog, monkeypatch):

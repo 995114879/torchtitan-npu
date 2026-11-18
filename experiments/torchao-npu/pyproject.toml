@@ -14,6 +14,6 @@ where = ["."]
 include = ["torchao_npu*"]
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
-testpaths = ["tests"]
+pythonpath = [".", "tests"]
+testpaths = ["tests/unit_tests"]
 addopts = ["--import-mode=importlib"]

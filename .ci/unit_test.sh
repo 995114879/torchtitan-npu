@@ -70,4 +70,8 @@ pip install --no-deps torchvision==0.29.0+cpu \
     --index-url https://download.pytorch.org/whl/cpu
 
 python -c 'from torchtitan.distributed.context_parallel.api import cp_shard; print(cp_shard.__module__)'
-python -m pytest -v --tb=short tests/unit_tests
+result=0
+python -m pytest -v --tb=short tests/unit_tests || result=1
+export PYTHON_BIN
+bash "${PROJECT_ROOT}/experiments/torchao-npu/scripts/run_tests.sh" cpu || result=1
+exit "${result}"

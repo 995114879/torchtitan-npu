@@ -34,3 +34,5 @@ tests/unit_tests/tooling/training_log_visualization/test_training_log_visualizat
 ## 执行归属
 
 只要测试放在 `tests/unit_tests/`，现有 `.ci/unit_test.sh` 的 `pytest tests/unit_tests` 就能发现它；报告仍须单独标注 `tooling`，避免把 tooling 通过数写成产品覆盖。后续若保留其他目录外的测试，必须在对应 CI suite 显式列出执行路径，不能依赖开发者手工运行。
+
+`experiments/torchao-npu` 保留独立测试目录，通过 `scripts/run_tests.sh cpu` 显式接入主仓 UT CI；其设备和集成测试使用手工入口。环境准备、依赖安装副作用、分层执行及报告判读见 [TorchAO-NPU 测试使用说明](../../experiments/torchao-npu/tests/README.md)。
