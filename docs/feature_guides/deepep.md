@@ -49,7 +49,7 @@ token 收发交换。该路径只在模型配置选择 DeepEP 并启用 override
 - **Pre-W2 score absorption**：routed experts 在 SwiGLU 之后、W2 之前乘 routing score；
   combine 不再重复加权。
 - **专用 EP 通信域**：`get_deepep_group()` 创建独立 HCCL group，与其他通信域隔离。
-- **训练 recipe**：DeepSeek-V4 的 `deepseek_v4_flash_deepep`、
+- **训练 recipe**：DeepSeek-V4 的 `deepseek_v4_flash_deepep`、`deepseek_v4_pro_deepep`、
   `deepseek_v4_flash_43layers_16experts_deepep`、
   `deepseek_v4_pro_61layers_32experts_deepep`、
   `deepseek_v4_pro_61layers_12experts_deepep`，GraphTrainer 的
@@ -72,7 +72,7 @@ DeepEP 要求 `expert_parallel_degree > 1`。`hidden_dim` 与 `num_max_tokens_pe
 阶段手工构造配置时必须自行提供。`seq_len` 必须能被
 `context_parallel_degree * tensor_parallel_degree` 整除。
 
-当前默认选择 DeepEP 的入口是 A5 脚本：DeepSeek-V4 的 `deepseek_v4_flash_cpt_4k_a5.sh`、
+当前默认选择 DeepEP 的入口是 A5 脚本：DeepSeek-V4 的 `deepseek_v4_flash_cpt_4k_a5.sh`、`deepseek_v4_pro_cpt_4k_a5.sh`、
 `debug/deepseek_v4_flash_8p_cpt_4k_a5.sh`、`debug/deepseek_v4_flash_8p_cpt_4k_a5_hif8.sh`、
 `debug/deepseek_v4_pro_32p_cpt_4k_a5.sh`、
 `debug/deepseek_v4_pro_8p_cpt_4k_a5_cpuoffload.sh`、
@@ -88,6 +88,12 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh
 
 `USE_GOLDEN=1` 时这些入口回到标准 dispatcher 的 reference 组合：`CONFIG` 换回非 deepep
 recipe，`CLI_OVERRIDES` 不再包含 `asc_deepep`。
+
+完整 Pro A5 4K 入口默认 FSDP=512、EP=128、GBS=4096，使用 61 层、384 专家的
+`deepseek_v4_pro_deepep` recipe。其量化白名单和 golden 分支约束见
+[Pro A5 4K 示例](../../examples/deepseek_v4/readme.md#a5-pro-4k)。
+该完整 64 节点 A5 配置尚未完成整网实机精度和性能验收；现有配置检查与 CI A3 smoke
+不构成该规模的 DeepEP 验收结论。
 
 ## 架构
 

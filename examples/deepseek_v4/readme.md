@@ -16,7 +16,7 @@ deepseek_v4_flash_cpt_4k_a3.sh
 - `deepseek_v4_flash_cpt_4k_a5.sh`：增加 A5 运行环境和默认 block-FP8 量化，其他配置复用 A3 基线。
 - `deepseek_v4_flash_cpt_1024k_a5.sh`：继续复用 A5 4K 入口，只通过 CLI 覆盖 1M 所需的 CP、DP、序列长度和 global batch size，量化默认随 A5 4K 入口继承。
 - 用户普通 CLI 参数位于默认选项之后，因此可以覆盖默认值（A5 的 activation-checkpoint 子命令仍在末尾），包括使用 `--extension.quantization.no-enable-quantized-training` 切换到 BF16。
-- MoE 强制负载均衡（`--debug.moe-force-load-balance`）仅用于调试；脚本默认不配置，需要时在命令末尾显式追加。
+- MoE 强制负载均衡（`--debug.moe-force-load-balance`）仅用于调试；完整 Pro A5 4K 入口默认启用，其他入口需要时在命令末尾显式追加。
 
 ## 编译配置
 
@@ -155,6 +155,31 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
   --compile.backend inductor \
   --training.steps 20
 ```
+
+### A5 Pro 4K
+
+`deepseek_v4_pro_cpt_4k_a5.sh` 使用完整 61 层、384 专家的
+`deepseek_v4_pro_deepep` recipe。默认 64 节点 × 8 设备，FSDP=512、EP=128、
+GBS=4096、MBS=1；融合、golden 及不同 CP 配置统一使用该默认 MBS，降低显存需求。
+训练参数仍可通过末尾 CLI 显式覆盖。
+
+```sh
+NODE_IPS="${NODE_IPS}" \
+bash examples/deepseek_v4/deepseek_v4_pro_cpt_4k_a5.sh --training.steps 5
+```
+
+该入口默认启用 model/inductor 编译、selective AC、MoE 强制负载均衡和 block-FP8，
+并关闭 swap optimizer。selective AC 从保存列表移除 mm/bmm，以重计算降低激活保存量。
+默认路由是性能调试配置，不代表自然路由的精度或性能结果。
+`USE_GOLDEN=1` 选择标准 dispatcher/reference 算子并不传入量化参数，默认 MBS=1；
+强制负载均衡和 AC 设置仍保留。完整 64 节点 A5 训练、精度及性能尚未实机验收，
+已完成的 launcher/配置检查和 CI A3 smoke 不替代该验收。
+
+Pro FSDP512 下显式开启 FSDP 预量化，但白名单仅含 `.attention.wq_b`：其本地
+权重为 `[128,1536]`，满足 64 对齐；`wo_a` 与 `indexer.wq_b` 分别仅 32/16 行，
+必须排除。384 专家在 FSDP512/EP128 下采用 `Shard(1)`，不在当前预量化支持范围内，
+因此 routed experts 也被排除。另显式配置 LI FP8、KV norm MXFP8（block size 64）；
+这些量化配置仅用于非 golden 路径。
 
 ### A5 64K
 

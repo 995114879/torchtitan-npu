@@ -520,6 +520,21 @@ def deepseek_v4_pro(
     )
 
 
+def deepseek_v4_pro_deepep(
+    *,
+    num_mtp_layers: int = 0,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_pro",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+        converters=converters,
+        moe_comm_backend="deepep",
+    )
+
+
 def deepseek_v4_pro_61layers_32experts(
     *,
     num_mtp_layers: int = 0,
