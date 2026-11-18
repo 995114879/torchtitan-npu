@@ -51,7 +51,13 @@ _DEVICE_CONTROL_TASK_PREFIXES = (
 _DEVICE_CONTROL_TASK_TYPES = {"COMMUNICATION"}
 
 _DEEPEP_COMMUNICATION_SCHEMAS = frozenset(
-    {"deepep::dispatch", "deepep::combine", "deepep::dispatch_backward", "deepep::combine_backward"}
+    {
+        "deepep::dispatch",
+        "deepep::dispatch_quantized_cached",
+        "deepep::combine",
+        "deepep::dispatch_backward",
+        "deepep::combine_backward",
+    }
 )
 
 

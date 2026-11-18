@@ -63,21 +63,37 @@ register_opaque_type(DispatchHandle, typ="reference")
 
 @torch.library.custom_op("deepep::dispatch", mutates_args=(), device_types="npu")
 def _dispatch_op_impl(
-    x: torch.Tensor,
+    x: list[torch.Tensor],
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
     num_local_experts: int,
     buffer: ElasticBufferHandle,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchHandle]:
-    """Dispatch into CANN's compact expert-major layout (non-cached mode)."""
-    x = x.contiguous()
+) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor, DispatchHandle]:
+    """Dispatch ``[x]`` or ``[qdata, scale]`` with one shared routing handle.
+
+    Tensor lists give both payload formats the same custom-op schema and
+    ``deepep.dispatch.default`` selective-AC save entry. Only ElasticBuffer's
+    Python boundary receives a tuple for the quantized payload.
+
+    The MXFP8 caller must use no_grad here: its external autograd Function
+    connects the received payload to the original high-precision activation
+    and router scores. Encoded uint8 scales have no payload gradient.
+    """
+    payload_tensors = x
+    if len(payload_tensors) not in (1, 2):
+        raise ValueError("DeepEP dispatch expects [x] or [qdata, scale]")
+    payload = (
+        payload_tensors[0].contiguous()
+        if len(payload_tensors) == 1
+        else (payload_tensors[0].contiguous(), payload_tensors[1].contiguous())
+    )
     topk_idx = topk_idx.contiguous()
     topk_weights = topk_weights.contiguous()
     elastic_buffer = buffer.value
 
-    recv_x, _recv_topk_idx, recv_scores, handle = elastic_buffer.dispatch(
-        x,
+    recv_payload, _recv_topk_idx, recv_scores, handle = elastic_buffer.dispatch(
+        payload,
         topk_idx=topk_idx,
         topk_weights=topk_weights,
         num_experts=num_experts,
@@ -89,10 +105,16 @@ def _dispatch_op_impl(
         # a non-negative value before allocating the exact receive tensors and routed metadata.
         do_cpu_sync=True,
     )
-    # Tensor input and explicit topk weights select the non-quantized,
-    # weighted overload of ElasticBuffer's union-typed API.
+    if len(payload_tensors) == 2:
+        if not isinstance(recv_payload, tuple) or len(recv_payload) != 2:
+            raise RuntimeError(
+                "ElasticBuffer must support tuple (qdata, scale) dispatch; rebuild the CANN ops and wheel"
+            )
+        received_payload = [cast("torch.Tensor", recv_payload[0]), cast("torch.Tensor", recv_payload[1])]
+    else:
+        received_payload = [cast("torch.Tensor", recv_payload)]
     return (
-        cast("torch.Tensor", recv_x),
+        received_payload,
         cast("torch.Tensor", recv_scores),
         handle.num_recv_tokens_per_expert,
         DispatchHandle(value=handle),
@@ -101,22 +123,60 @@ def _dispatch_op_impl(
 
 @_dispatch_op_impl.register_fake
 def _dispatch_fake(
-    x: torch.Tensor,
+    x: list[torch.Tensor],
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
     num_experts: int,
     num_local_experts: int,
     buffer: ElasticBufferHandle,
 ):
-    # recv_x.shape[0] is data-dependent (actual tokens received at runtime), so a
+    payload_tensors = x
+    if len(payload_tensors) not in (1, 2):
+        raise ValueError("DeepEP dispatch expects [x] or [qdata, scale]")
+    # Every payload has the same data-dependent receive count, so a
     # static upper bound would fail inductor's assert_size_stride. This dynamic
     # symbol represents the actual number of rows produced by dispatch.
     num_recv = torch.library.get_ctx().new_dynamic_size()
     return (
-        x.new_empty((num_recv, x.shape[1])),
-        x.new_empty((num_recv,), dtype=torch.float32),
-        x.new_empty((num_local_experts,), dtype=torch.int64),
+        [tensor.new_empty((num_recv, tensor.shape[1])) for tensor in payload_tensors],
+        payload_tensors[0].new_empty((num_recv,), dtype=torch.float32),
+        payload_tensors[0].new_empty((num_local_experts,), dtype=torch.int64),
         DispatchHandle(),
+    )
+
+
+@torch.library.custom_op("deepep::dispatch_quantized_cached", mutates_args=(), device_types="npu")
+def _dispatch_quantized_cached_op_impl(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    handle: DispatchHandle,
+    num_permuted_tokens: int,
+    buffer: ElasticBufferHandle,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reuse routing inside combine's first-order VJP; no payload autograd."""
+    recv_payload, _, _, _ = buffer.value.dispatch(
+        (qdata.contiguous(), scale.contiguous()),
+        handle=handle.value,
+        # Both payloads follow the original route, with no new count synchronization.
+        do_cpu_sync=False,
+    )
+    if not isinstance(recv_payload, tuple):
+        raise RuntimeError("ElasticBuffer cached dispatch must return (qdata, scale)")
+    return recv_payload
+
+
+@_dispatch_quantized_cached_op_impl.register_fake
+def _dispatch_quantized_cached_fake(
+    qdata: torch.Tensor,
+    scale: torch.Tensor,
+    handle: DispatchHandle,
+    num_permuted_tokens: int,
+    buffer: ElasticBufferHandle,
+):
+    # Use the saved dispatch score tensor's row count, as the BF16 path does.
+    return (
+        qdata.new_empty((num_permuted_tokens, qdata.shape[1])),
+        scale.new_empty((num_permuted_tokens, scale.shape[1])),
     )
 
 
@@ -227,6 +287,8 @@ def _combine_backward_fake(
 
 def _dispatch_setup_context(ctx, inputs, output) -> None:
     x, topk_idx, _topk_weights, _num_experts, _num_local_experts, buffer = inputs
+    if len(x) != 1:
+        raise RuntimeError("MXFP8 DeepEP payloads require torch.no_grad() and the MXFP8 dispatcher's logical backward")
     (
         _recv_x,
         _recv_scores,
@@ -236,8 +298,8 @@ def _dispatch_setup_context(ctx, inputs, output) -> None:
     ctx.save_for_backward(topk_idx)
     ctx.handle = handle
     ctx.buffer = buffer
-    ctx.input_dtype = x.dtype
-    ctx.hidden = x.shape[1]
+    ctx.input_dtype = x[0].dtype
+    ctx.hidden = x[0].shape[1]
 
 
 def _dispatch_backward(
@@ -299,5 +361,15 @@ def _combine_backward(ctx, grad_combined):
     return grad_x, None, None, None, None
 
 
-torch.library.register_autograd("deepep::dispatch", _dispatch_backward, setup_context=_dispatch_setup_context)
+def _dispatch_list_backward(ctx, grad_recv_x, grad_recv_scores, grad_counts, grad_handle):
+    # Tensor[] gradients mirror the input list. Keep the tensor-based VJP
+    # helper shared with TorchAO's logical MXFP8 activation/score backward.
+    # ``grad_recv_x`` is None when the whole payload list output is unused, so
+    # guard the index and let ``_dispatch_backward`` synthesize/route the rest.
+    grad_x = None if grad_recv_x is None else grad_recv_x[0]
+    grad_inputs = _dispatch_backward(ctx, grad_x, grad_recv_scores, grad_counts, grad_handle)
+    return [grad_inputs[0]], *grad_inputs[1:]
+
+
+torch.library.register_autograd("deepep::dispatch", _dispatch_list_backward, setup_context=_dispatch_setup_context)
 torch.library.register_autograd("deepep::combine", _combine_backward, setup_context=_combine_setup_context)

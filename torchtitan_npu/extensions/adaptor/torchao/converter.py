@@ -249,8 +249,8 @@ def apply_quantization_converter(
         quantization_config.validate()
     # Recipe-independent, so it is installed here rather than in
     # _hif8_param_swap: these are block ops, not quantized ops, and MXFP8 wants
-    # them saved just as much as HiF8 does. Off by default -- at level 0
-    # nothing is patched and the partition is the one we ship today.
+    # them saved just as much as HiF8 does. Off by default at level 0.
+    # Both DeepEP payload formats use the upstream default dispatch save entry.
     _save_block_ops_under_selective_ac(quantization_config.save_block_ops_level)
     if not quantization_config.enable_quantized_training:
         logger.info("enable_quantized_training=False; skipping TorchAO-NPU quantization")
@@ -298,23 +298,21 @@ def apply_quantization_converter(
         recipe=quantization_config.recipe,
         strict=quantization_config.fsdp_prequantize_fqns is not None,
     )
-
     logger.info(
-        "Applied TorchAO-NPU compute_quantization=%s, recipe=%s, sparse_attention_quantization=%s, mxfp4_qat=%s, "
-        "li_quantization=%s, kv_norm_quantization=%s, kv_norm_block_size=%s, "
-        "dst_type_max=%s, enable_fsdp_prequantize=%s, fsdp_prequantize_dtype=%s, "
-        "all_to_all_quant_format=%s",
-        quantization_config.enable_quantized_training,
-        quantization_config.recipe,
-        quantization_config.enable_sparse_attention_quantization,
-        quantization_config.enable_mxfp4_qat,
-        quantization_config.li_quantization,
-        quantization_config.kv_norm_quantization.format,
-        quantization_config.kv_norm_quantization.block_size,
-        quantization_config.dst_type_max,
-        quantization_config.enable_fsdp_prequantize,
-        quantization_config.fsdp_prequantize_dtype,
-        quantization_config.all_to_all_quant_format,
+        "Applied TorchAO-NPU quantization summary: %s",
+        {
+            "compute_quantization": quantization_config.enable_quantized_training,
+            "recipe": quantization_config.recipe,
+            "sparse_attention_quantization": quantization_config.enable_sparse_attention_quantization,
+            "mxfp4_qat": quantization_config.enable_mxfp4_qat,
+            "li_quantization": quantization_config.li_quantization,
+            "kv_norm_format": quantization_config.kv_norm_quantization.format,
+            "kv_norm_block_size": quantization_config.kv_norm_quantization.block_size,
+            "dst_type_max": quantization_config.dst_type_max,
+            "enable_fsdp_prequantize": quantization_config.enable_fsdp_prequantize,
+            "fsdp_prequantize_dtype": quantization_config.fsdp_prequantize_dtype,
+            "all_to_all_quant_format": quantization_config.all_to_all_quant_format,
+        },
     )
     return replace(model_spec, model=model_config)
 

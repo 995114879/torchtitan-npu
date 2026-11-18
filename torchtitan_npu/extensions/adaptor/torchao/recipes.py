@@ -311,26 +311,32 @@ class NpuAllToAllQuantizeConverter(QuantizationConverter):
         self.config = config
 
     def convert(self, model_config):
-        from torchao_npu.quantized_modules.token_dispatcher import (
-            get_mxfp8_alltoall_dispatcher_cls,
-            mxfp8_quant_params_from_experts,
-        )
+        from torchao_npu.quantized_modules.token_dispatcher import mxfp8_quant_params_from_experts
         from torchtitan.models.common.moe import RoutedExperts
-
-        from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
         routed_configs = list(model_config.traverse(RoutedExperts.Config))
         if not routed_configs:
-            raise ValueError("all_to_all_quant_format requires a standard AllToAllTokenDispatcher")
+            raise ValueError(
+                "all_to_all_quant_format requires a standard AllToAllTokenDispatcher or DeepEPTokenDispatcher"
+            )
 
+        # ``moe_comm_backend`` is selected when the model config is created, so
+        # every routed-expert node normally has the same dispatcher family.
+        # Resolve the MXFP8 factory once from the first source config and reuse
+        # it for all nodes below.
+        first_fqn, first_routed_config, _, _ = routed_configs[0]
+        dispatcher_factory, dispatcher_config_type = self._resolve_dispatcher_factory(
+            first_fqn, first_routed_config.token_dispatcher
+        )
         replacements = []
         for fqn, routed_config, _, _ in routed_configs:
             dispatcher_config = routed_config.token_dispatcher
-            if not isinstance(dispatcher_config, AllToAllTokenDispatcher.Config):
+            if not isinstance(dispatcher_config, dispatcher_config_type):
                 raise ValueError(
-                    "all_to_all_quant_format supports only standard AllToAllTokenDispatcher; "
-                    f"{type(dispatcher_config).__qualname__} at model_spec.model.{fqn}.token_dispatcher "
-                    "is unsupported (including DeepEP)"
+                    "all_to_all_quant_format requires one dispatcher backend per model; "
+                    f"model_spec.model.{fqn}.token_dispatcher has "
+                    f"{type(dispatcher_config).__qualname__}, expected a "
+                    f"{dispatcher_config_type.__qualname__}"
                 )
             try:
                 quant_params = mxfp8_quant_params_from_experts(routed_config.inner_experts)
@@ -339,7 +345,7 @@ class NpuAllToAllQuantizeConverter(QuantizationConverter):
             dispatcher_owner = type(dispatcher_config)._owner
             if dispatcher_owner is None:
                 raise TypeError(f"Dispatcher config at {fqn + '.token_dispatcher'!r} has no owning module class")
-            quantized_dispatcher = get_mxfp8_alltoall_dispatcher_cls(dispatcher_owner)
+            quantized_dispatcher = dispatcher_factory(dispatcher_owner)
             replacements.append((fqn, routed_config, dispatcher_config, quantized_dispatcher, quant_params))
 
         for fqn, routed_config, dispatcher_config, quantized_dispatcher, quant_params in replacements:
@@ -357,6 +363,33 @@ class NpuAllToAllQuantizeConverter(QuantizationConverter):
 
         logger.info("Installed torchao-npu MXFP8 communication on %d all-to-all dispatcher node(s)", len(replacements))
         return model_config
+
+    def _resolve_dispatcher_factory(self, fqn, dispatcher_config):
+        """Resolve the MXFP8 factory and config family selected by the model."""
+        from torchao_npu.quantized_modules.token_dispatcher import get_mxfp8_alltoall_dispatcher_cls
+
+        from torchtitan_npu.extensions.adaptor.torchao.deepep_token_dispatcher import get_mxfp8_deepep_dispatcher_cls
+        from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import (
+            AllToAllTokenDispatcher,
+            DeepEPTokenDispatcher,
+        )
+
+        if not isinstance(dispatcher_config, (AllToAllTokenDispatcher.Config, DeepEPTokenDispatcher.Config)):
+            raise ValueError(
+                "all_to_all_quant_format supports only AllToAllTokenDispatcher or DeepEPTokenDispatcher; "
+                f"{type(dispatcher_config).__qualname__} at model_spec.model.{fqn}.token_dispatcher is unsupported"
+            )
+        dispatcher_factory = (
+            get_mxfp8_deepep_dispatcher_cls
+            if isinstance(dispatcher_config, DeepEPTokenDispatcher.Config)
+            else get_mxfp8_alltoall_dispatcher_cls
+        )
+        dispatcher_config_type = (
+            DeepEPTokenDispatcher.Config
+            if isinstance(dispatcher_config, DeepEPTokenDispatcher.Config)
+            else AllToAllTokenDispatcher.Config
+        )
+        return dispatcher_factory, dispatcher_config_type
 
 
 def _get_configs(modules_dict):

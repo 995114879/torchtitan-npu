@@ -470,6 +470,18 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         self._deepep_group = deepep_group
         self._deepep_world_size = deepep_group.size()
 
+    def _dispatch_activation_exchange(self, x_td, topk_expert_ids_tk, topk_scores_tk):
+        """Communication seam shared by high-precision and quantized dispatchers."""
+        recv_payload, recv_scores, counts, handle = torch.ops.deepep.dispatch(
+            [x_td],
+            topk_expert_ids_tk,
+            topk_scores_tk,
+            self.num_experts,
+            self.num_experts // self._deepep_world_size,
+            self._deepep_buffer_handle,
+        )
+        return recv_payload[0], recv_scores, counts, handle
+
     # pyrefly: ignore [bad-override]
     def dispatch(
         self,
@@ -486,13 +498,10 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
             recv_scores,
             num_global_tokens_per_local_expert_e,
             handle,
-        ) = torch.ops.deepep.dispatch(
+        ) = self._dispatch_activation_exchange(
             x_TD,
             topk_expert_ids_TK,
             topk_scores_TK,
-            self.num_experts,
-            self.num_experts // self._deepep_world_size,
-            self._deepep_buffer_handle,
         )
         return (
             hidden_states_RD,
@@ -520,15 +529,20 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         weighted_states = routed_output_RD
         if not self.absorb_router_scores:
             weighted_states = routed_output_RD * metadata.recv_scores.to(routed_output_RD.dtype).reshape(-1, 1)
-        combined_TD = torch.ops.deepep.combine(
-            weighted_states,
+
+        return self._combine_activation_exchange(weighted_states, metadata, x_TD.shape[0])
+
+    def _combine_activation_exchange(self, routed_output_rd, metadata, num_tokens):
+        """Combine already weighted expert outputs; metadata supplies routing only."""
+        combined_td = torch.ops.deepep.combine(
+            routed_output_rd,
             metadata.handle,
-            x_TD.shape[0],
+            num_tokens,
             # Preserve the dispatch row-count source for compiled backward.
             metadata.recv_scores,
             self._deepep_buffer_handle,
         )
-        return combined_TD
+        return combined_td
 
 
 @override(
@@ -549,5 +563,9 @@ def asc(
 def asc_deepep(
     cfg: DeepEPTokenDispatcher.Config,
 ) -> AscDeepEPTokenDispatcher.Config:
-    """Select the CANN implementation for a DeepEP config."""
+    """Select CANN without discarding an already-specialized NPU dispatcher."""
+    # TorchAO converts before Trainer applies overrides. Re-deriving an MXFP8
+    # config to the base NPU config would drop its quantized dispatch/combine.
+    if isinstance(cfg, AscDeepEPTokenDispatcher.Config):
+        return cfg
     return derive(cfg, AscDeepEPTokenDispatcher.Config)

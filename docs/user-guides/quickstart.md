@@ -135,7 +135,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 | --- | --- | --- |
 | `enable-quantized-training` | `--enable-quantized-training` / `--no-enable-quantized-training` | 启用或关闭低精度训练，默认关闭。 |
 | `recipe` | DeepSeek: `all_mxfp8`、`mix`、`all_block_fp8`、`all_hif8`；Qwen3.5: `W4A8_MXFP`、`W8A8_MXFP8` | DeepSeek 选择 MXFP8/Block FP8/HiF8 recipe；Qwen3.5 两个 recipe 仅支持 dense 模型，不支持 MoE 模型或 shared experts，也不量化视觉编码器；激活为 MXFP8，`W4A8_MXFP` 权重带 MXFP4 fake quant，`W8A8_MXFP8` 权重为 Block FP8。 |
-| `all-to-all-quant-format` | `--all-to-all-quant-format mxfp8` | 默认未设置。指定 `mxfp8` 时，对标准 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，不支持 DeepEP。开启示例及限制见[MoE all-to-all 低精度通信](../feature_guides/low_precision_training.md#moe-all-to-all-低精度通信)。 |
+| `all-to-all-quant-format` | `--all-to-all-quant-format mxfp8` | 默认未设置。指定 `mxfp8` 时，对 EP dispatcher 的正向 dispatch 和 combine 反向启用 MXFP8 token 通信。要求低精度训练和 MX 兼容 recipe，支持 DeepEP 和 standard 两种通信方式，启用该配置时自动跟随高精度的通信方式。开启示例及限制见[MoE all-to-all 低精度通信](../feature_guides/low_precision_training.md#moe-all-to-all-低精度通信)。 |
 | `enable-mxfp4-qat` | `--enable-mxfp4-qat` / `--no-enable-mxfp4-qat` | 为 DeepSeek routed expert 启用或关闭 MXFP4 QAT 约束，默认关闭；Qwen3.5 `W4A8_MXFP` 的 dense 权重不依赖该开关。 |
 | `li-quantization` | `fp8`、`mxfp8`、`mxfp4`、`hif8` | 选择 LI Q/K 的量化类型，默认不启用；DeepSeek-V4.1 仅支持 `mxfp4`。 |
 | `kv-norm-quantization.format` | `mxfp8` | 启用 DeepSeek-V4 KV Cache 的 MXFP8 量化。 |
@@ -152,7 +152,7 @@ DeepSeek-V4.1 使用 `li-quantization=mxfp4` 启用 Lightning Indexer 量化，�
 `enable-sparse-attention-quantization` 启用 KV source Compressor 与稀疏 attention 量化。
 稀疏 attention 量化可单独启用；启用 Lightning Indexer 量化时必须同时启用稀疏 attention
 量化。标准 A5 融合路径提供 BF16 fallback，`USE_GOLDEN=1` 不提供这些 fallback。启动日志中出现
-`Applied TorchAO-NPU recipe=...` 表示 recipe 已应用。
+`Applied TorchAO-NPU quantization summary: {...}` 表示 recipe 已应用（`recipe` 字段为实际 recipe）。
 
 DeepSeek-V4.1 模型做 Block FP8 低精度预训练可运行以下脚本：
 

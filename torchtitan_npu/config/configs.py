@@ -157,7 +157,7 @@ class QuantizationExtensionConfig:
 
     enable_quantized_training: bool = False
     all_to_all_quant_format: Literal["mxfp8"] | None = None
-    """Standard EP communication format for dispatch forward and combine backward."""
+    """Dispatch forward/combine backward format; the model selects the EP backend."""
     enable_sparse_attention_quantization: bool = False
     recipe: QuantizationRecipe = "all_block_fp8"
     enable_mxfp4_qat: bool = False
