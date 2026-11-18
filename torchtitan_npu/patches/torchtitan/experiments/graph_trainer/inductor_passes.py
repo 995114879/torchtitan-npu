@@ -90,9 +90,11 @@ def _compile_boxed_region(gm, attr_sources=None):
             env[node] = graph.node_copy(node, env.__getitem__)
     region = fx.GraphModule(gm, graph)
     disable_remat = getattr(regional_inductor, "_disable_remat_for_regional_subcompile", nullcontext)
+    # Peak-memory reordering can move RS waits ahead of independent backward
+    # compute, undoing the FSDP overlap schedule established on the FX graph.
     with (
         torch._guards.tracing(torch._guards.TracingContext(torch._guards.detect_fake_mode(inputs))),
-        torch._inductor.config.patch({"eager_numerics.division_rounding": True, "reorder_for_peak_memory": True}),
+        torch._inductor.config.patch({"eager_numerics.division_rounding": True, "reorder_for_peak_memory": False}),
         torch._inductor.config.patch(options),
         disable_remat(),
     ):
