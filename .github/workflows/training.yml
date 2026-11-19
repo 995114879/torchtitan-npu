@@ -25,8 +25,13 @@ permissions:
   actions: read
 
 # Serialize scheduled and manual Nightly runs without cancelling remote jobs.
+# Pull requests share one group per PR so repeated pushes cannot stack several
+# full matrices on the shared NPU cluster; a superseded run is left to finish
+# instead of being cancelled, which would orphan already-dispatched training.
 concurrency:
-  group: training-${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'nightly')) && 'nightly' || github.run_id }}
+  group: >-
+    training-${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.suite == 'nightly'))
+    && 'nightly' || (github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number)) || github.run_id }}
   cancel-in-progress: false
 
 env:

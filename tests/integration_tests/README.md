@@ -191,13 +191,14 @@ python -m tests.integration_tests.run_tests /tmp/v41_muon_adapter_resume \
 ## 二、分层训练用例（Lite Actions）
 
 Lite Actions 的用例清单由 [`.github/ci/suites.json`](../../.github/ci/suites.json) 管理，
-具体定义位于 [`training_cases/`](training_cases/)。当前只接入已经验证的 `base` 层；`pr.py` 和 `nightly.py` 保留为空占位，后续验证完成后再补充。
+具体定义位于 [`training_cases/`](training_cases/)。当前接入 `base` 层和 A5 `pr` 增量层；
+`nightly` 层继续继承 `pr`，本阶段不新增用例。
 
 | Suite | 当前内容 |
 | --- | --- |
-| `base` | 5 个基础用例 |
-| `pr` | 继承 `base`，暂无新增用例 |
-| `nightly` | 继承 `pr`，暂无新增用例 |
+| `base` | 5 个 A3 基础用例 |
+| `pr` | 继承 `base`，新增 7 个 A5 单机用例，共 12 个 |
+| `nightly` | 继承 `pr`，无新增用例，共 12 个 |
 
 ### 2.1 当前用例
 
@@ -208,9 +209,58 @@ Lite Actions 的用例清单由 [`.github/ci/suites.json`](../../.github/ci/suit
 | base_03 `dsv4_flash_a3_8p_cp1_ep8_graphtrainer` | A3，1 × 8P，CP1 / EP8 | DSV4 Flash 裁剪模型、GraphTrainer、`aot_fx_trace` |
 | base_04 `dsv41_flash_a3_8p_multimodal_cpt_eager` | A3，1 × 8P，EP8 | DSV4.1 Flash 裁剪多模态、图文 CPT、eager |
 | base_05 `dsv41_flash_a3_8p_multimodal_cpt_compile` | A3，1 × 8P，EP8 | DSV4.1 Flash 裁剪多模态、图文 CPT、compile |
+| pr_01 `dsv4_flash_a5_8p_cp2_ep8_eager` | A5，1 × 8P，CP2 / EP8 / DP shard4 | DSV4 Flash A5 DeepEP、Block-FP8、Muon、eager |
+| pr_02 `dsv4_flash_a5_8p_cp1_ep8_compile` | A5，1 × 8P，CP1 / EP8 / DP shard8 | DSV4 Flash A5 DeepEP、Block-FP8、Muon、compile |
+| pr_03 `dsv41_flash_a5_8p_cp1_ep8_eager` | A5，1 × 8P，CP1 / EP8 / DP shard8 | DSV4.1 Flash 24 experts 多模态、图文 CPT、Engram、DeepEP、eager |
+| pr_04 `dsv41_flash_a5_8p_cp1_ep8_compile` | A5，1 × 8P，CP1 / EP8 / DP shard8 | DSV4.1 Flash 24 experts 多模态、图文 CPT、Engram、DeepEP、compile |
+| pr_05 `dsv4_flash_a5_8p_cp1_ep8_graphtrainer` | A5，1 × 8P，CP1 / EP8 / DP shard8 | DSV4 Flash GraphTrainer、DeepEP MoE |
+| pr_06 `dsv41_flash_a5_8p_cp1_ep8_qat` | A5，1 × 8P，CP1 / EP8 / DP shard8 | DSV4.1 Flash MXFP4 QAT、Block-FP8、量化稀疏 attention、compile |
+| pr_07 `dsv4_flash_a5_8p_cp1_ep8_qat` | A5，1 × 8P，CP1 / EP8 / DP shard8 | DSV4 Flash MXFP4 QAT、Block-FP8、compile |
 
-所有当前用例执行 10 步，使用随机初始化；文本用例使用仓内 C4 资产，base_04 和 base_05 需要 CC12M 图文数据及 `DATASET_PATH`。
-Lite Actions 的详细 launch、verify、资产注入和跨机调度说明后续补充。
+`base` 层保留原有 5 个 A3 用例；`pr` 层新增 7 个 A5 单机用例；`nightly` 层当前不新增用例。
+DSV4 裁剪配置保留 43 层、16 experts；DSV4.1 A3 裁剪配置保留 40 层、16 experts，A5 多模态裁剪用例使用 40 层、24 experts；Engram 表均缩至 100000 行。
+pr_03、pr_04、pr_06 需要 CC12M 图文数据。
+每项检查均要求训练退出码为 0、TensorBoard 的 loss 和 grad_norm 有限、步数完整且不重复。
+
+A5 用例不注入 `CONFIG`，直接沿用各 `*_a5.sh` 启动脚本的 `*_deepep` 默认配置与配套
+`CLI_OVERRIDES`，避免 `asc_deepep` 替换目标失配后退回参考 `AllToAllTokenDispatcher`；
+`CP`、`MBS`、`DP_SHARD` 同样保留各启动脚本的默认值，只有 pr_01 为 CP2 显式覆盖 `CP=2` 与 `DP_SHARD=4`。
+
+### 2.2 资产与运行入口
+
+先从仓库根目录查看清单，无需 NPU：
+
+```bash
+python -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite base
+python -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite pr
+python -m tests.integration_tests.tools.lite_actions.entrypoint inspect --suite nightly
+```
+
+运行节点需要已安装与当前分支匹配的 TorchTitan、torch_npu、CANN 及配方所需扩展。
+`required_env` 在启动前检查路径存在，具体资产内容仍由站点准备：
+
+| 环境变量 | 使用范围 | 内容 |
+| --- | --- | --- |
+| `ASCEND_SET_ENV_PATH` | 全部 | CANN `set_env.sh` |
+| `HF_ASSETS_PATH` | 全部 | 对应模型 tokenizer 资产目录 |
+| `DATASET_PATH` | base_04、base_05、pr_03、pr_04、pr_06 | CC12M 图文数据 |
+
+其余文本用例固定使用仓内 `tests/assets/c4_test`。单机 checkpoint 自动隔离到该用例的输出目录。
+
+单机示例：
+
+```bash
+# 在已准备 NPU 环境的 shell 中设置资产路径。
+export ASCEND_SET_ENV_PATH="${CANN_ROOT}/set_env.sh"
+export HF_ASSETS_PATH="${TOKENIZER_DIR}"
+python -m tests.integration_tests.tools.lite_actions.entrypoint launch \
+  --test-id dsv4_flash_a3_16p_cp2_ep8_compile --output-dir "${OUTPUT_DIR}"
+```
+
+`OUTPUT_DIR` 必须为空，并使用节点本地目录。
+
+一次 `launch` 已顺序执行该用例的全部训练阶段；调度器不需要另行循环 `phases`。
+单机 `launch` 内部完成 verify；跨机执行和结果汇总不在本阶段范围内。
 
 ---
 
@@ -240,6 +290,9 @@ gh workflow run dispatcher_smoke.yml -R torchtitan-npu/torchtitan-npu --ref mast
 ```
 
 ### 3.3 CI 矩阵并发与动态端口分配
+
+请求内每个 case 携带 `device`（`a3` / `a5`）、`nnodes`、`ngpu`、`required_env` 与 `phases`，
+调度端必须按 case 的 `device` 路由硬件，不能只按 pipeline 选平台：`pr` 继承 `base` 后同时包含 A3 与 A5 用例。
 
 在 GitHub Actions CI 流水线中，每个 Matrix Case 是独立的调度与执行单元：
 * **并发调度**：Lite Actions 调度机会根据物理集群的空闲 NPU 资源池，将互不冲突的 Case 并发拉起执行（如单机 8P 各用例并发执行，或双机 16P 跨节点独立分配）。

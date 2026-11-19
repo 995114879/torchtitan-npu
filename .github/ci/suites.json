@@ -15,7 +15,15 @@
       "extends": [
         "base"
       ],
-      "cases": []
+      "cases": [
+        "dsv4_flash_a5_8p_cp2_ep8_eager",
+        "dsv4_flash_a5_8p_cp1_ep8_compile",
+        "dsv41_flash_a5_8p_cp1_ep8_eager",
+        "dsv41_flash_a5_8p_cp1_ep8_compile",
+        "dsv4_flash_a5_8p_cp1_ep8_graphtrainer",
+        "dsv41_flash_a5_8p_cp1_ep8_qat",
+        "dsv4_flash_a5_8p_cp1_ep8_qat"
+      ]
     },
     "nightly": {
       "extends": [

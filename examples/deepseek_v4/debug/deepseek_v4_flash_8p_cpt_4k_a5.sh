@@ -114,6 +114,5 @@ QUANTIZATION_ARGS=(
 # follow all regular options and override targets.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a3.sh" \
     "${QUANTIZATION_ARGS[@]}" \
-    --hf-assets-path "/path/to/tokenizer/folder" \
     "$@" \
     activation-checkpoint:"${AC_MODE}"
