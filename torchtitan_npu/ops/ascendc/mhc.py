@@ -61,9 +61,23 @@ torch.library.register_autograd(
 )
 
 
-def _mhc_pre_sinkhorn_setup_context(ctx, inputs, output):
+def _mhc_pre_sinkhorn_setup_context(ctx, inputs, output, keyword_only_inputs=None):
+    """Save the operands ``mhc_pre_sinkhorn_backward`` needs.
+
+    torch calls the callback with keyword arguments, spelling the extra
+    ``keyword_only_inputs`` only once the schema declares keyword-only
+    arguments; both shapes must be accepted and the names must stay exactly as
+    torch passes them.  ops-transformer added ``*, bool enable_hf32=True``
+    (next to the optional ``pre_mix``) to ``mhc_pre_sinkhorn``; those defaults
+    only select optional features, never reach the backward formula, and the
+    fused HcPre path never passes ``pre_mix``, so the backward keeps its
+    nine-gradient contract.
+    """
     x, phi, alpha, bias = inputs[:4]
     ctx.save_for_backward(x, phi, alpha, bias, *output[3:])
+    # ``hcEps`` belongs to the stable positional prefix
+    # (x, phi, alpha, bias, hcMult, numIters, hcEps, normEps, outFlag); the
+    # optional tail appended after ``outFlag`` never shifts it.
     ctx.hc_eps = inputs[6]
 
 
