@@ -50,8 +50,14 @@ override：
 5. 调用工厂函数生成 replacement config，再由后续 `build()` 构造组件。
 
 所有匹配都基于修改前的配置树收集。replacement 不会被再次遍历，因此条目顺序不会改变
-匹配结果。成功替换后，日志会记录工厂函数、配置节点 FQN 及替换前后的配置类型。
-包加载的配置观察扩展补充 `[Override entry]` 命中数与 FQN、`[Override zero match]` 的类型/FQN 和量化接管候选，以及 `[Override configured]` 的最终实现与几何和 `[Override quantization]` 的量化配置。解析失败和 claim 冲突分别标记；configured 日志表示构建前选定实现，不证明设备 kernel 已执行。 诊断所依赖的上游私有接口或配置汇总不可用时，会记录 `[Override diagnostics unavailable]` 告警并继续使用原始 `apply_overrides`；原始配置校验、冲突检查和工厂异常仍按上游规则执行。
+匹配结果。包加载的配置观察扩展会将工厂名、替换前后配置类名及入口 `kwargs` 相同的逐节点
+`[Override]` 成功日志合并为一条（列出 `matched` 命中数与全部节点 `fqns`），并保留
+`Applied N override(s)` 汇总。`[Override zero match]` 提供类型、FQN 筛选条件及候选配置；
+`[Override configured]` 按节点最终实现与几何参数汇总（仅表示构建前选定实现，不证明设备
+kernel 已执行）；`[Override quantization]` 记录量化配置；`[Override resolution failed]`
+与 `[Override conflict]` 分别标记解析失败和节点冲突。诊断接口或配置汇总不可用时会记录
+`[Override diagnostics unavailable]` 告警并回退到上游 `apply_overrides`，配置校验、冲突
+检查和工厂异常仍按上游规则执行。
 
 ## 目录规则
 

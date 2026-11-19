@@ -8,7 +8,7 @@
 This module owns the apply_overrides extension. It activates after package patches
 and before trainer extensions, refreshing already captured upstream bindings too.
 The pinned upstream's read-only claim helpers keep diagnostics aligned with its
-selection rules; upstream still owns every mutation and successful replacement log.
+selection rules. The v0.3.0 backport applies replacements and groups success logs.
 """
 
 import importlib
@@ -20,8 +20,9 @@ from functools import wraps
 from torchtitan.config.configurable import Configurable
 from torchtitan.tools.logging import logger
 
+from torchtitan_npu.patches.torchtitan.config.override import apply_overrides as _apply_overrides
+
 _override = importlib.import_module("torchtitan.config.override")
-_original_apply_overrides = _override.apply_overrides
 _FIELDS = (
     "backend",
     "kernel",
@@ -76,7 +77,7 @@ def _config_summary(config_root):
         )
 
 
-def _report_override_entries(override_config, config_root):
+def _report_override_issues(override_config, config_root):
     """Inspect claims without applying factories or mutating the config tree."""
     entries = [(e, {}) if isinstance(e, str) else e for e in override_config.imports]
     try:
@@ -91,34 +92,33 @@ def _report_override_entries(override_config, config_root):
     except ValueError:
         logger.error("[Override conflict] imports=%s", [name for name, _ in entries])
         return
+    matched = {claim.ov.name for claim in claims}
     for ov, _ in resolved:
-        fqns = [claim.fqn for claim in claims if claim.ov.name == ov.name]
-        if fqns:
-            logger.info("[Override entry] %s matched=%d fqns=%s", ov.name, len(fqns), fqns)
-        else:
-            candidates = [
-                (fqn, f"{type(cfg).__module__}.{type(cfg).__qualname__}")
-                for fqn, cfg, _, _ in config_root.traverse(ov.target_cls, recurse=True)
-            ]
-            logger.warning(
-                "[Override zero match] %s matched=0 target=%s.%s exact=%s fqns=%s "
-                "candidate_configs=%s; check FQN/type filters or quantization takeover",
-                ov.name,
-                ov.target_cls.__module__,
-                ov.target_cls.__qualname__,
-                ov.exact,
-                ov.fqns,
-                candidates,
-            )
+        if ov.name in matched:
+            continue
+        candidates = [
+            (fqn, f"{type(cfg).__module__}.{type(cfg).__qualname__}")
+            for fqn, cfg, _, _ in config_root.traverse(ov.target_cls, recurse=True)
+        ]
+        logger.warning(
+            "[Override zero match] %s matched=0 target=%s.%s exact=%s fqns=%s "
+            "candidate_configs=%s; check FQN/type filters or quantization takeover",
+            ov.name,
+            ov.target_cls.__module__,
+            ov.target_cls.__qualname__,
+            ov.exact,
+            ov.fqns,
+            candidates,
+        )
 
 
-@wraps(_original_apply_overrides)
+@wraps(_apply_overrides)
 def apply_overrides(override_config, config_root):
     """Report effective configs; upstream remains the authority for validation."""
     # Private inspection helpers may change when the pinned upstream is upgraded.
     # Diagnostics must not prevent its public apply function from validating a run.
     try:
-        _report_override_entries(override_config, config_root)
+        _report_override_issues(override_config, config_root)
     except Exception:
         logger.warning(
             "[Override diagnostics unavailable] entry inspection failed; delegating validation "
@@ -127,7 +127,7 @@ def apply_overrides(override_config, config_root):
         )
 
     # Keep mutations and factory exceptions outside the diagnostic fallback.
-    result = _original_apply_overrides(override_config, config_root)
+    result = _apply_overrides(override_config, config_root)
     try:
         _config_summary(config_root)
     except Exception:

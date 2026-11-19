@@ -64,10 +64,13 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | [#4763](https://github.com/pytorch/torchtitan/pull/4763) | 向 GraphTrainer graph pass 提供运行时上下文，用于 auto-overlap 调度时整图 profiling |
 | [#4934](https://github.com/pytorch/torchtitan/pull/4934) | FSDP unshard 去重时优先保留有消费者的输出，避免将 FP8 量化结果替换为未使用的 BF16 输出，对应 `experiments/graph_trainer/fsdp_passes.py` |
 | [#201621](https://github.com/pytorch/pytorch/pull/201621) | 为本地 FileSystemReader 增加可选 mmap 加载，对应 `distributed/checkpoint/filesystem` |
+| [#6180](https://github.com/pytorch/torchtitan/pull/6180) | 回移 override 成功日志分组，对应 `config/override.py` |
 
 上述 7 个 TorchTitan PR（#4534、#4575、#4578、#4598、#4663、#4664、#4934）已在上游合入，但 `v0.3.0` 尚未包含这些修复。
 
 四个 EP overlap 补丁的作用、启用方式与排查手段见
 [`docs/feature_guides/graph_trainer_ep_overlap.md`](../../../docs/feature_guides/graph_trainer_ep_overlap.md)。
+
+Override 日志分组由 `config/override.py` 回移到 TorchTitan v0.3.0。升级到包含该实现的上游版本后，删除补丁并让配置观察扩展直接委托上游 `apply_overrides`。
 
 对应 PR 合入且 TorchTitan 依赖更新后，应删除相关补丁及导入；全部补丁清理完成后，删除本目录。
