@@ -2,6 +2,8 @@
 
 """CPU-bound contract tests for the AscendC MoE operator wrappers."""
 
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -436,3 +438,123 @@ def test_dispatcher_absorption_local_path_matches_post_w2_reference(monkeypatch)
     )
     assert len(seen_probs) == 1
     torch.testing.assert_close(seen_probs[0], torch.ones_like(scores))
+
+
+def _register_deepep_ops():
+    """Ensure ``deepep::dispatch`` / ``deepep::combine`` are registered so the
+    seam monkeypatch below has concrete namespace targets."""
+    import importlib
+
+    # PyTorch has moved these private opaque-object symbols between releases.
+    # Adapt the test import surface before loading production ``deepep.py``; the
+    # production module deliberately remains unchanged. Release builds keep
+    # ``CustomClassBase`` in ``torch._library.opaque_object`` while dev builds
+    # moved it to ``torch._custom_class_base`` and renamed the registration
+    # helper, so mirror the compatibility shim used by ``test_deepep_fake``.
+    opaque_object = importlib.import_module("torch._library.opaque_object")
+    if not hasattr(opaque_object, "CustomClassBase"):
+        try:
+            custom_class_base = importlib.import_module("torch._custom_class_base").CustomClassBase
+        except (ImportError, AttributeError):
+            pytest.skip("PyTorch build lacks the opaque-object custom-op API")
+        opaque_object.CustomClassBase = custom_class_base
+    if not hasattr(opaque_object, "register_opaque_type"):
+        register_custom_class = getattr(opaque_object, "register_custom_class", None)
+        if register_custom_class is None:
+            pytest.skip("PyTorch build lacks the opaque-object registration API")
+        opaque_object.register_opaque_type = register_custom_class
+
+    # The conftest fakes ``cann_ops_transformer`` without the symbols the op
+    # module imports at module level; augment once so it imports on CPU.
+    cann = sys.modules["cann_ops_transformer"]
+    if not hasattr(cann, "ElasticBuffer"):
+        cann.ElasticBuffer = type("ElasticBuffer", (), {})
+    if not hasattr(cann, "EPHandle"):
+        cann.EPHandle = type("EPHandle", (), {})
+    return importlib.import_module("torchtitan_npu.ops.ascendc.deepep")
+
+
+def test_deepep_dispatch_combine_seam_routes_twice_through_cann_boundary(monkeypatch):
+    """AscDeepEPTokenDispatcher dispatches/combines only through its two seams.
+
+    The refactor exposes ``_dispatch_activation_exchange`` /
+    ``_combine_activation_exchange`` as the exclusive transport seam shared by
+    the high-precision and the MXFP8-quantized dispatchers.
+    """
+    from torchtitan_npu.override.common.token_dispatcher import AscDeepEPTokenDispatcher, DispatchState
+
+    _register_deepep_ops()
+    dispatcher = object.__new__(AscDeepEPTokenDispatcher)
+    dispatcher.num_experts = 8
+    dispatcher._deepep_world_size = 2
+    dispatcher._deepep_buffer_handle = object()
+    dispatcher.absorb_router_scores = False
+
+    calls = []
+
+    def fake_dispatch(x, topk_idx, topk_scores, num_experts, num_local, buffer):
+        assert len(x) == 1
+        calls.append(
+            (
+                "dispatch",
+                num_experts,
+                num_local,
+                buffer is dispatcher._deepep_buffer_handle,
+                x[0].dtype,
+                topk_idx.dtype,
+            )
+        )
+        return x, topk_scores, torch.tensor([3, 3], dtype=torch.int64), "HANDLE"
+
+    def fake_combine(x, handle, num_tokens, recv_scores, buffer):
+        calls.append(("combine", handle, num_tokens, buffer is dispatcher._deepep_buffer_handle))
+        return x
+
+    monkeypatch.setattr(torch.ops.deepep, "dispatch", fake_dispatch)
+    monkeypatch.setattr(torch.ops.deepep, "combine", fake_combine)
+
+    x_td = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+    topk_scores_tk = torch.tensor([[0.1, 0.9], [0.2, 0.8], [0.6, 0.4], [0.3, 0.7]])
+    topk_expert_ids_tk = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]])
+    routed, counts, metadata = dispatcher.dispatch(x_td, topk_scores_tk, topk_expert_ids_tk, torch.tensor([2, 2]))
+
+    assert isinstance(metadata, DispatchState)
+    assert metadata.handle == "HANDLE"
+    assert metadata.recv_scores is topk_scores_tk.float().contiguous()
+    assert metadata.routed_scores_R is None
+    assert torch.equal(counts, torch.tensor([3, 3]))
+    assert calls[-1] == ("dispatch", 8, 4, True, torch.bfloat16, torch.int32)
+
+    output = dispatcher.combine(routed, metadata, x_td)
+    assert output.shape == x_td.shape
+    assert calls[-1] == ("combine", "HANDLE", 8, True)
+
+
+def test_deepep_dispatch_seam_exposes_routed_scores_when_absorbing(monkeypatch):
+    from torchtitan_npu.override.common.token_dispatcher import AscDeepEPTokenDispatcher
+
+    _register_deepep_ops()
+    dispatcher = object.__new__(AscDeepEPTokenDispatcher)
+    dispatcher.num_experts = 8
+    dispatcher._deepep_world_size = 2
+    dispatcher._deepep_buffer_handle = object()
+    dispatcher.absorb_router_scores = True
+
+    def fake_dispatch(x, topk_idx, topk_scores, num_experts, num_local, buffer):
+        return x, topk_scores, torch.tensor([2, 2], dtype=torch.int64), "HANDLE"
+
+    def fake_combine(x, handle, num_tokens, recv_scores, buffer):
+        return x
+
+    monkeypatch.setattr(torch.ops.deepep, "dispatch", fake_dispatch)
+    monkeypatch.setattr(torch.ops.deepep, "combine", fake_combine)
+
+    x_td = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+    topk_scores_tk = torch.tensor([[0.1, 0.9], [0.2, 0.8], [0.6, 0.4], [0.3, 0.7]])
+    topk_expert_ids_tk = torch.tensor([[0, 1], [1, 0], [0, 1], [1, 0]])
+
+    routed, _counts, metadata = dispatcher.dispatch(x_td, topk_scores_tk, topk_expert_ids_tk, torch.tensor([2, 2]))
+    assert metadata.routed_scores_R is metadata.recv_scores
+
+    output = dispatcher.combine(routed, metadata, x_td)
+    assert output.shape == x_td.shape

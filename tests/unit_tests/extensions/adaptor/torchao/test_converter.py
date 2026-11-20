@@ -598,35 +598,64 @@ def test_alltoall_quantization_reports_unresolved_scale_algorithm_without_replac
     )
 
 
-def test_alltoall_quantization_rejects_deepep_dispatcher(converter_module):
+@pytest.mark.parametrize(
+    "use_late_override",
+    [False, True],
+    ids=["deepep", "deepep-late-override"],
+)
+def test_alltoall_quantization_preserves_deepep_backend(use_late_override, converter_module, monkeypatch):
+    from torchtitan.config.override import OverrideConfig, apply_overrides
     from torchtitan.models.common.moe import RoutedExperts
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
+    from torchtitan_npu.extensions.adaptor.torchao import deepep_token_dispatcher
     from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.override.common.token_dispatcher import AscDeepEPTokenDispatcher
 
+    monkeypatch.setattr(deepep_token_dispatcher, "_dispatcher_cache", {})
     model_spec = model_registry("debugmodel", moe_comm_backend="deepep")
-    original_dispatchers = []
-    for _, config, _, _ in model_spec.model.traverse(RoutedExperts.Config):
-        token_dispatcher = config.token_dispatcher  # pyrefly: ignore [missing-attribute]
-        original_dispatchers.append(type(token_dispatcher)._owner)
-
-    with pytest.raises(ValueError, match=r"supports only standard AllToAllTokenDispatcher.*DeepEP"):
-        converter_module.apply_quantization_converter(
-            model_spec,
-            QuantizationExtensionConfig(
-                enable_quantized_training=True,
-                recipe="all_block_fp8",
-                all_to_all_quant_format="mxfp8",
-            ),
-            model_compile_enabled=False,
+    for _, routed_config, _, _ in model_spec.model.traverse(RoutedExperts.Config):
+        routed_config.token_dispatcher.absorb_router_scores = True
+    converted = converter_module.apply_quantization_converter(
+        model_spec,
+        QuantizationExtensionConfig(
+            enable_quantized_training=True,
+            recipe="all_mxfp8",
+            all_to_all_quant_format="mxfp8",
+        ),
+        model_compile_enabled=False,
+    )
+    if use_late_override:
+        # Match Trainer's order: converter first, explicit overrides before build.
+        apply_overrides(
+            OverrideConfig(imports=["torchtitan_npu.override.common.token_dispatcher.asc_deepep"]),
+            converted.model,
         )
-
-    assert original_dispatchers
-    converted_dispatchers = []
-    for _, config, _, _ in model_spec.model.traverse(RoutedExperts.Config):
+    routed = list(converted.model.traverse(RoutedExperts.Config))
+    assert routed
+    parent_cls = AscDeepEPTokenDispatcher
+    for _, config, _, _ in routed:
         token_dispatcher = config.token_dispatcher  # pyrefly: ignore [missing-attribute]
-        converted_dispatchers.append(type(token_dispatcher)._owner)
-    assert converted_dispatchers == original_dispatchers
+        dispatcher_cls = type(token_dispatcher)._owner
+        assert issubclass(dispatcher_cls, parent_cls)
+        assert dispatcher_cls.__name__ == f"MXFP8{parent_cls.__name__}"
+        assert isinstance(token_dispatcher, dispatcher_cls.Config)
+        assert token_dispatcher.mxfp8_quant_params[0] == 32
+        assert token_dispatcher.absorb_router_scores is True
+        assert dispatcher_cls._dispatch_activation_exchange is not parent_cls._dispatch_activation_exchange
+        assert dispatcher_cls._combine_activation_exchange is not parent_cls._combine_activation_exchange
+
+
+def test_mxfp8_deepep_dispatcher_factory_is_cached_and_idempotent(monkeypatch):
+    from torchtitan_npu.extensions.adaptor.torchao import deepep_token_dispatcher
+    from torchtitan_npu.extensions.adaptor.torchao.deepep_token_dispatcher import get_mxfp8_deepep_dispatcher_cls
+    from torchtitan_npu.override.common.token_dispatcher import AscDeepEPTokenDispatcher
+
+    monkeypatch.setattr(deepep_token_dispatcher, "_dispatcher_cache", {})
+    dispatcher_cls = get_mxfp8_deepep_dispatcher_cls(AscDeepEPTokenDispatcher)
+    assert dispatcher_cls.__name__ == "MXFP8AscDeepEPTokenDispatcher"
+    # Feeding an already-generated subclass is idempotent (no re-wrapping).
+    assert get_mxfp8_deepep_dispatcher_cls(dispatcher_cls) is dispatcher_cls
 
 
 @pytest.mark.parametrize("quant_format", ["mx", "block_mx"])

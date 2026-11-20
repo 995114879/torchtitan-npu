@@ -106,6 +106,7 @@ def test_deepep_stages_share_ordered_communication_group():
     stages = []
     for schema_name in (
         "deepep::dispatch",
+        "deepep::dispatch_quantized_cached",
         "deepep::combine",
         "deepep::dispatch_backward",
         "deepep::combine_backward",
@@ -126,6 +127,7 @@ def test_deepep_stages_share_ordered_communication_group():
 
     assert list(keys.values()) == [
         (0, "deepep::dispatch", 0),
+        (0, "deepep::dispatch_quantized_cached", 0),
         (0, "deepep::combine", 0),
         (0, "deepep::dispatch_backward", 0),
         (0, "deepep::combine_backward", 0),
@@ -135,6 +137,7 @@ def test_deepep_stages_share_ordered_communication_group():
         (0, "deepep::combine_backward", 1),
         (0, "deepep::dispatch", 1),
         (0, "deepep::dispatch_backward", 1),
+        (0, "deepep::dispatch_quantized_cached", 1),
     )
 
 

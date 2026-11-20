@@ -45,7 +45,7 @@ python -m tests.integration_tests.run_tests \
 4die 冒烟测试及专项验证包含以下 Suite：
 * **`models`**：DeepSeek-V4、DeepSeek-V4.1、DeepSeek-V3.2 多卡基础训练冒烟与 Loss 对齐校验；
 * **`deepseek_v4_checkpoint`**：DeepSeek-V4 分布式断点续训两阶段比对；
-* **`deepseek_v4_quantized`**：DeepSeek-V4 Block-FP8 量化（需 Ascend 950 芯片）；
+* **`deepseek_v4_quantized`**：DeepSeek-V4 Block-FP8/MXFP8 量化及 DeepEP 低精通信（需 Ascend 950 芯片）；
 * **`deepseek_v4_1`**：DeepSeek-V4.1 文本和图像 LoRA 训练与 PEFT 导出；同时纳入默认 `models` suite；
 * **`deepseek_v4_1_checkpoint`**：DeepSeek-V4.1 AdamW/Muon 断点续训验证，单独运行；
 * **`deepseek_v4_1_quantized`**：DeepSeek-V4.1 Block-FP8 LoRA 专项验证，需支持的设备和运行时；
@@ -119,6 +119,16 @@ python -m tests.integration_tests.run_tests \
     --test_suite deepseek_v4_quantized \
     --test_name dsv4_lora_block_fp8_ep2_fsdp2 \
     --ngpu 2
+  ```
+
+* **DeepEP MXFP8 完整训练 (`deepseek_v4_quantized`)**：
+  同一量化套件还包含 `dsv4_deepep_mxfp8_ep2_fsdp2`。该用例需要 2 张 Ascend 950、TorchAO-NPU 以及支持 MXFP8 payload 的 CANN ElasticBuffer，使用仓内 C4/tokenizer 数据，执行 DeepSeek-V4 debug model 的两步 EP2/FSDP2 训练，检查四段通信、激活和 score 梯度、专家/router 权重更新以及有限的 loss/grad_norm。它验证训练完成性，不比较高精基线误差。
+
+  ```bash
+  python -m tests.integration_tests.run_tests ./test_reports/deepep \
+    --test_suite deepseek_v4_quantized \
+    --test_name dsv4_deepep_mxfp8_ep2_fsdp2 \
+    --ngpu 2 --no-parallel
   ```
 
 * **Qwen3.5 `W4A8_MXFP`/`W8A8_MXFP8` 量化场景 (`qwen3_5_quantized`)**：

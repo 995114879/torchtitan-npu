@@ -6,6 +6,7 @@
 from dataclasses import replace
 
 from tests.integration_tests import OverrideDefinitions
+from tests.integration_tests.deepep import build_deepep_test_list
 
 # DeepSeek-V4 NPU recipe from the example scripts.  Ascend attention and MHC
 # overrides are only used on the fused path.
@@ -106,7 +107,7 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
 
 
 def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
-    return [
+    cases = [
         OverrideDefinitions(
             test_name="dsv4_mxfp4_communication_fsdp2",
             test_descr="MXFP4 QAT communication, two forward/backward/optimizer steps on A5",
@@ -153,6 +154,8 @@ def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
             check_resume=False,
         ),
     ]
+    # DeepEP needs the same A5/TorchAO runtime as the other quantized cases.
+    return cases + build_deepep_test_list()
 
 
 def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
