@@ -396,7 +396,9 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
         "TrainerEx.Config",
         SimpleNamespace(
             sdc=SimpleNamespace(build=build_sdc),
-            parallelism=SimpleNamespace(disable_expert_replication=False),
+            parallelism=SimpleNamespace(
+                extensions=SimpleNamespace(disable_expert_replication=False, context_parallel_intra_degree=-1)
+            ),
             anticipatory=SimpleNamespace(enable=False),
             extension=ExtensionConfig(),
             training=SimpleNamespace(extension=SimpleNamespace(allow_hf32=True)),

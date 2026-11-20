@@ -66,10 +66,10 @@ hsdp_config = ConfigManager().parse_args([
     '--parallelism.data-parallel-shard-degree', '4',
     '--parallelism.data-parallel-replicate-degree', '2',
     '--parallelism.expert-parallel-degree', '4',
-    '--parallelism.disable-expert-replication',
+    '--parallelism.extensions.disable-expert-replication',
 ])
 assert isinstance(hsdp_config, module.FaultTolerantTrainerEx.Config)
-assert hsdp_config.parallelism.disable_expert_replication
+assert hsdp_config.parallelism.extensions.disable_expert_replication
 module.FaultTolerantTrainerEx._validate_supported_config(hsdp_config)
 
 def set_path(root, path, value):

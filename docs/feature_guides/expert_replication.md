@@ -1,7 +1,7 @@
 # Dense 副本与专家分片
 
 DeepSeek-V4 和 DeepSeek-V4.1 可在保留 Dense 参数副本的同时，将路由专家权重分片到全部专家数据并行卡上。
-使用 `--parallelism.disable-expert-replication` 启用，默认关闭，不改变现有切分方式。
+使用 `--parallelism.extensions.disable-expert-replication` 启用，默认关闭，不改变现有切分方式。
 
 ## 配置示例
 
@@ -12,7 +12,7 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
   --parallelism.data-parallel-shard-degree 4 \
   --parallelism.data-parallel-replicate-degree 2 \
   --parallelism.expert-parallel-degree 4 \
-  --parallelism.disable-expert-replication \
+  --parallelism.extensions.disable-expert-replication \
   --compile.no-enable \
   --training.global-batch-size 8 \
   --training.steps 10
@@ -39,7 +39,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
   --parallelism.data-parallel-shard-degree 4 \
   --parallelism.data-parallel-replicate-degree 2 \
   --parallelism.expert-parallel-degree 4 \
-  --parallelism.disable-expert-replication \
+  --parallelism.extensions.disable-expert-replication \
   --optimizer.name AdamW --compile.no-enable \
   --training.seq-len 512 --training.global-batch-size 8 --training.steps 10
 ```

@@ -74,7 +74,7 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
             raise ValueError("NPU TorchFT currently supports DeepSeek-V4 Flash recipes only")
 
         parallelism = config.parallelism
-        if parallelism.data_parallel_replicate_degree != 1 and not parallelism.disable_expert_replication:
+        if parallelism.data_parallel_replicate_degree != 1 and not parallelism.extensions.disable_expert_replication:
             raise ValueError(
                 "NPU TorchFT requires data_parallel_replicate_degree=1 unless disable_expert_replication is enabled"
             )

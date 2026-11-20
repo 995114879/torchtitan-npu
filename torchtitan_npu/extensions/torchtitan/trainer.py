@@ -33,6 +33,7 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.router import con
 from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule
 
 from .tools.profiler import CANNProfiler
+from .distributed.cp_exchange import install as install_cp_exchange
 from .distributed.expert_replication import shard_experts_across_replicas
 
 
@@ -84,7 +85,7 @@ class TrainerEx(Trainer):
                 self.optimizer._cpu_offload = self.training.enable_cpu_offload
             self._post_init_optimizer()
             validate_anticipatory_config(self)
-            if getattr(self.parallelism, "disable_expert_replication", False):
+            if self.parallelism.extensions.disable_expert_replication:
                 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
                 if self.model_spec is None or self.model_spec.name not in ("deepseek_v4", "deepseek_v4_1"):
@@ -148,7 +149,11 @@ class TrainerEx(Trainer):
                         )
 
     def __init__(self, config: Config):
-        if getattr(config.parallelism, "disable_expert_replication", False):
+        # Boundary for run-wide switches: a constructed-but-never-built config must not patch
+        # anything, and a later run in this process must not inherit this one's bound -- at the
+        # default degree `install` revokes it and the exchange falls back to the flat collective.
+        install_cp_exchange(config.parallelism.extensions.context_parallel_intra_degree)
+        if config.parallelism.extensions.disable_expert_replication:
             config = copy(config)
             assert config.model_spec is not None
             config.model_spec = replace(

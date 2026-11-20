@@ -17,6 +17,7 @@ import torchtitan_npu.config as npu_config
 import torchtitan_npu.extensions.torchtitan.trainer as trainer_module
 from torchtitan_npu.config import (
     ExtensionConfig,
+    ParallelismExtensionConfig,
     MuonOptimizerProfile,
     OptimizerConfig,
     ParallelismConfig,
@@ -80,7 +81,7 @@ def test_config_manager_adapts_standard_component_configs_without_changing_value
         assert getattr(config, config_field.name) == getattr(source, config_field.name)
     assert isinstance(config.profiler, CANNProfiler.Config)
     assert isinstance(config.parallelism, ParallelismConfig)
-    assert config.parallelism.disable_expert_replication is False
+    assert config.parallelism.extensions.disable_expert_replication is False
     for config_field in fields(source.parallelism):
         assert getattr(config.parallelism, config_field.name) == getattr(source.parallelism, config_field.name)
     assert isinstance(config.profiler.build(), CANNProfiler)
@@ -655,3 +656,23 @@ def test_trainer_ex_config_build_constructs_trainer_ex(monkeypatch):
     assert len(built_configs) == 1
     assert isinstance(built_configs[0], TrainerEx.Config)
     assert built_configs[0].training.extension.allow_hf32 is False
+
+
+def test_the_cp_alltoall_intra_degree_needs_one_tensor_parallel_rank() -> None:
+    """A supernode is a run of NPUs, so the CP axis may only be contiguous while TP is 1."""
+    ParallelismConfig(context_parallel_degree=4, extensions=ParallelismExtensionConfig(context_parallel_intra_degree=2))
+    with pytest.raises(ValueError, match="tensor_parallel_degree == 1"):
+        ParallelismConfig(
+            context_parallel_degree=4,
+            tensor_parallel_degree=2,
+            extensions=ParallelismExtensionConfig(context_parallel_intra_degree=2),
+        )
+
+
+@pytest.mark.parametrize(("degree", "intra"), [(4, 8), (4, 3), (2, 0)])
+def test_the_cp_alltoall_intra_degree_has_to_fit_inside_the_cp_axis(degree: int, intra: int) -> None:
+    with pytest.raises(ValueError, match="context_parallel_intra_degree"):
+        ParallelismConfig(
+            context_parallel_degree=degree,
+            extensions=ParallelismExtensionConfig(context_parallel_intra_degree=intra),
+        )

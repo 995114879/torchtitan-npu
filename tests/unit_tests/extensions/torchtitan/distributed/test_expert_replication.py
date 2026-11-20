@@ -16,7 +16,7 @@ from torchtitan.config import ConfigManager
 from torchtitan.distributed import ParallelDims
 from torchtitan.trainer import Trainer
 
-from torchtitan_npu.config import ParallelismConfig
+from torchtitan_npu.config import ParallelismConfig, ParallelismExtensionConfig
 from torchtitan_npu.extensions.torchtitan.distributed import fsdp
 from torchtitan_npu.extensions.torchtitan.distributed.expert_replication import shard_experts_across_replicas
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
@@ -62,7 +62,7 @@ def cpu_meshes(monkeypatch, tmp_path):
 def test_cli_policy_sets_expert_storage_without_changing_dense_placement(
     monkeypatch, tmp_path, cpu_meshes, model_name, enabled
 ):
-    args = ["--parallelism.disable-expert-replication"] if enabled else []
+    args = ["--parallelism.extensions.disable-expert-replication"] if enabled else []
     config = _config(tmp_path, *args, model_name=model_name)
     with torch.device("meta"):
         model = config.model_spec.model.build()
@@ -138,7 +138,10 @@ def _raises_cli_config_error(capsys, message):
 def test_cli_rejects_graph_trainer(tmp_path, capsys):
     with _raises_cli_config_error(capsys, "not supported by GraphTrainer"):
         _config(
-            tmp_path, "--parallelism.disable-expert-replication", "--parallelism.spmd-backend", "full_dtensor",
+            tmp_path,
+            "--parallelism.extensions.disable-expert-replication",
+            "--parallelism.spmd-backend",
+            "full_dtensor",
             config_name="graph_trainer_deepseek_v4_debugmodel",
         )
 
@@ -150,7 +153,7 @@ def test_cli_rejects_other_models(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(registry, "deepseek_v4_debugmodel", lambda: source)
 
     with _raises_cli_config_error(capsys, "requires DeepSeek-V4"):
-        _config(tmp_path, "--parallelism.disable-expert-replication")
+        _config(tmp_path, "--parallelism.extensions.disable-expert-replication")
 
 
 @pytest.mark.parametrize(
@@ -169,20 +172,20 @@ def test_rejects_unsupported_replication_configuration(kwargs, message):
     values = {"data_parallel_replicate_degree": 2, "expert_parallel_degree": 4, **kwargs}
 
     with pytest.raises(ValueError, match=message):
-        ParallelismConfig(disable_expert_replication=True, **values)
+        ParallelismConfig(extensions=ParallelismExtensionConfig(disable_expert_replication=True), **values)
 
 
 def test_cli_rejects_muon_replica_dedup(tmp_path, capsys):
     with _raises_cli_config_error(capsys, "incompatible with muon_enable_hsdp_replica_dedup"):
         _config(
-            tmp_path, "--parallelism.disable-expert-replication",
+            tmp_path, "--parallelism.extensions.disable-expert-replication",
             "--optimizer.name", "Muon", "--optimizer.muon-enable-hsdp-replica-dedup",
         )
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["replicated-experts", "sharded-experts"])
 def test_trainer_injects_policy_without_mutating_recipe(monkeypatch, tmp_path, enabled):
-    config = _config(tmp_path, *(["--parallelism.disable-expert-replication"] if enabled else []))
+    config = _config(tmp_path, *(["--parallelism.extensions.disable-expert-replication"] if enabled else []))
     original_spec = config.model_spec
     original_parallelize = original_spec.parallelize_fn
     captured = []

@@ -247,15 +247,53 @@ class ExtensionConfig:
 
 
 @dataclass(kw_only=True, slots=True)
-class ParallelismConfig(_BaseParallelismConfig):
-    """NPU parallelism options."""
+class ParallelismExtensionConfig:
+    """NPU-only parallelism knobs, namespaced so the CLI stays ``--parallelism.extensions.*``.
+
+    Kept in one nested group instead of flat fields on ``ParallelismConfig``: the
+    upstream schema is the review surface for parallelism, and these switches only
+    exist because of this repository's NPU paths.
+    """
 
     disable_expert_replication: bool = False
     """Shard routed experts across the dense replica axis as well as EFSDP."""
 
+    context_parallel_intra_degree: int = -1
+    """CP ranks that may share one AllToAllV, i.e. the NPUs of one supernode.
+
+    ``-1`` keeps the whole CP axis as one all-to-all domain, which is the flat exchange and the
+    only shape today's hardware needs.  ``8`` covers ``cp=16`` over two 8-NPU supernodes, ``128``
+    a full supernode; the exchange lives in ``extensions/torchtitan/distributed/cp_exchange``.
+
+    A CP axis that is wider than one supernode reads its exchange plan on the host, so it cannot
+    run under ``torch.compile``: that combination raises instead of tracing a graph that would
+    disagree with the flat exchange.  A CP axis that fits in one supernode keeps the flat
+    collective and compiles normally.
+    """
+
+
+@dataclass(kw_only=True, slots=True)
+class ParallelismConfig(_BaseParallelismConfig):
+    """NPU parallelism options."""
+
+    extensions: ParallelismExtensionConfig = field(default_factory=ParallelismExtensionConfig)
+
     def __post_init__(self) -> None:
         _BaseParallelismConfig.__post_init__(self)
-        if not self.disable_expert_replication:
+        intra = self.extensions.context_parallel_intra_degree
+        if intra != -1 and (intra < 1 or self.context_parallel_degree % intra):
+            raise ValueError(
+                f"context_parallel_intra_degree ({intra}) must be -1 (whole CP axis) or divide "
+                f"context_parallel_degree ({self.context_parallel_degree}): pass the NPU count of one "
+                "supernode, e.g. 128 or 8"
+            )
+        if intra > 0 and self.tensor_parallel_degree != 1:
+            # Supernodes are runs of NPUs, and the CP axis only holds consecutive NPUs while TP is
+            # 1: with TP=2 an `intra` block of CP ranks would span twice as many NPUs.
+            raise ValueError(
+                f"context_parallel_intra_degree requires tensor_parallel_degree == 1, got {self.tensor_parallel_degree}"
+            )
+        if not self.extensions.disable_expert_replication:
             return
         if self.data_parallel_replicate_degree <= 1 or self.expert_parallel_degree <= 1:
             raise ValueError("disable_expert_replication requires data_parallel_replicate_degree > 1 and EP > 1")

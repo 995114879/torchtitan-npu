@@ -101,6 +101,34 @@ SWA 前缀交换是本仓扩展。
 arch22 + CP 下 `A3KeyWorkaround` 的压实行数是 device 值，与 `fullgraph=True` 的编译不兼容；栈在
 `parallelize` 里按 `is_a5() or cp <= 1` 关闭编译（`compile_policy.py`），退化为 eager 并告警。
 
+### 4.1 跨超节点：`--parallelism.extensions.context-parallel-intra-degree`
+
+后续硬件不允许单个 AllToAllV 跨 128 卡超节点。EP 可以靠选域避开，CP 不行：doc-chunk 把 rank `r` 的
+query 绑到每篇文档第 `r` 片，而还原的 KV 归属由 `q // C` 与置换决定，`d` 天然遍历整个 CP 轴；跨超节点
+p2p 也不可用（只在 `world_rank % 16` 相同时合法，`intra=8` 时列步长是 8），所以跨超节点那一步只能用
+all-gather。
+
+该开关声明一个 AllToAllV 允许跨越的 CP rank 数（即一个超节点的 NPU 数），`-1`（默认）不生效。设置后
+`extensions/torchtitan/distributed/cp_exchange` 把 CP 上用到的 `all_to_all_single` 换成两步：每 rank 把
+「发往本组之外」的行在列上（每超节点一个 rank）all-gather 一次，再在超节点内 all-to-all 一次，输出与 flat
+交换同序同值。**模型代码不需要感知这个限制**：注入是符号替换，`models/` 一行不改；`-1` 时函数不被替换、
+通信域不创建。跨超节点流量（`m = cp / intra` 个超节点，`C` 为每 rank 行数）为每 rank 收 `(m-1)·C(m-1)/m`
+行，`m=2` 时正好是理论下界（相比 flat 减半），代价是超节点内多一次 all-to-all。
+
+```bash
+--parallelism.context-parallel-degree 256 --parallelism.extensions.context-parallel-intra-degree 128   # 128 卡超节点
+--parallelism.context-parallel-degree 16  --parallelism.extensions.context-parallel-intra-degree 8     # 8 卡超节点
+```
+
+该开关要求 `--parallelism.tensor-parallel-degree 1`：超节点是连续的一段 NPU，而 CP 轴的 rank 只有在 TP=1 时
+才是连续的 world rank，否则一个 `intra` 块会跨到下一个超节点。`-1`（默认）不安装；若同一进程里先前安装过，
+`-1` 会撤销上一次的度数，交换退回 flat 集合通信。
+
+该开关不支持 `torch.compile`：交换的 padding 与切片边界来自列内各成员的 split 表，需要在 host 上求值，被
+`fullgraph=True` 追踪时会直接报错并提示关闭模型编译，而不是编出一个与 flat 不一致的图。只有「CP 轴宽于一个
+超节点」的交换会被拒绝；`cp` 本身不超过一个超节点时仍走 flat 集合通信，可以正常编译。编译支持需要
+metadata 侧的 seam，留作后续统一处理。
+
 ## 5. 启用
 
 ```bash
