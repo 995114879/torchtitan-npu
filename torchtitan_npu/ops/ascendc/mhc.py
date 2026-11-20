@@ -117,3 +117,79 @@ torch.library.register_autograd(
     _mhc_pre_sinkhorn_backward,
     setup_context=_mhc_pre_sinkhorn_setup_context,
 )
+
+
+def _mhc_pre_sinkhorn_premix_setup_context(ctx, inputs, output):
+    # Operand order: x, phi, alpha, bias, premix, hcMult, numIters, hcEps,
+    # normEps, needBackward. ``premix`` is kept so its gradient slot can be
+    # filled on the way back.
+    x, phi, alpha, bias, premix = inputs[:5]
+    ctx.save_for_backward(x, phi, alpha, bias, premix, *output[3:])
+    ctx.hc_eps = inputs[7]
+
+
+def _mhc_pre_sinkhorn_premix_backward(ctx, grad_h_in, grad_h_post, grad_h_res, grad_h_pre, *_):
+    """Backward of ``mhc_pre_sinkhorn_premix``.
+
+    ``grad_h_pre`` is the gradient that reaches the exported ``pre`` from the next
+    sub-layer's collapse; it is handed to the kernel as ``gradPre``. The kernel
+    still expects a tensor when that output went unused, so a zero gradient
+    stands in. It returns ``gradPremix`` alongside the parameter gradients, which
+    becomes the gradient of the ``premix`` operand.
+    """
+    (
+        x,
+        phi,
+        alpha,
+        bias,
+        premix,
+        h_pre,
+        hc_before_norm,
+        inv_rms,
+        sum_out,
+        norm_out,
+    ) = ctx.saved_tensors
+    if grad_h_in is None:
+        grad_h_in = torch.zeros((*x.shape[:-2], x.shape[-1]), dtype=x.dtype, device=x.device)
+
+    grad_pre = None if premix is None else (grad_h_pre if grad_h_pre is not None else torch.zeros_like(premix))
+
+    grad_x, grad_phi, grad_alpha, grad_bias, grad_premix = (
+        torch.ops.cann_ops_transformer.mhc_pre_sinkhorn_premix_backward(
+            grad_h_in,
+            grad_h_post,
+            grad_h_res,
+            x,
+            phi,
+            alpha,
+            bias,
+            h_pre,
+            hc_before_norm,
+            inv_rms,
+            sum_out,
+            norm_out,
+            premix,
+            grad_pre,
+            ctx.hc_eps,
+        )
+    )
+    grad_premix_ret = grad_premix if (premix is not None and grad_premix.numel() > 0) else None
+    # Forward operand order: x, phi, alpha, bias, premix, hcMult, numIters,
+    # hcEps, normEps, needBackward. The kernel's ``gradPremix`` fills the
+    # ``premix`` slot (dropped when the operand was absent or the kernel returns
+    # an empty tensor); the attribute slots take ``None``.
+    return grad_x, grad_phi, grad_alpha, grad_bias, grad_premix_ret, None, None, None, None, None
+
+
+try:
+    torch.library.register_autograd(
+        "cann_ops_transformer::mhc_pre_sinkhorn_premix",
+        _mhc_pre_sinkhorn_premix_backward,
+        setup_context=_mhc_pre_sinkhorn_premix_setup_context,
+    )
+except AttributeError as e:
+    # The experimental op is absent from older CANN builds; the rest of this
+    # module (``mhc_post``, ``mhc_pre_sinkhorn``) stays usable without it.
+    from torchtitan.tools.logging import logger
+
+    logger.warning("[mhc] mhc_pre_sinkhorn_premix is not registered by this CANN build; skipping autograd: %s", e)

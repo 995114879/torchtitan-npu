@@ -447,6 +447,7 @@ kernel；使用它需要额外安装与当前 CANN 匹配的 `pypto` runtime，�
 | `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | AscendC attention 前后向；`topk_scores` 作为教师边。该 config 按**自己的 `compress_ratio`** 预计算 attention 与 indexer 的 metadata（每个几何每 microbatch 一次，全层共享同一份 entry），因此没有单独的 metadata 入口；kernel geometry 是该 config 自己的必需字段，由 override 参数一次写入，默认值为 V4.1-Flash 形状。本入口不声明任何量化：量化 selector 的 metadata 属于量化后的 attention backend，它替换本节点并自建 entry（见下文），本入口在那条路径上不生效 |
 | `lightning_indexer.asc` | `InnerIndexer.Config`（精确匹配） | `AscInnerIndexer.Config` | 融合 LI 选分与 SLIKG 反向；它的两条 AI_CPU metadata 由 `sparse_attn.asc` 的几何一并预计算，随同一份 map entry 下发 |
 | `mhc.asc_sinkhorn` | `HcPre.Config`（精确匹配） | `AscV41HcPre.Config` | 仅融合 Sinkhorn，保留调用方的 pre mix |
+| `mhc.asc_hc_premix` | `HcPre.Config`（精确匹配） | `AscV41HcPrePremix.Config` | 融合 Sinkhorn 与压流，算子 `mhc_pre_sinkhorn_premix`。**约束**：仅 A5（`premix` 输入）、`hc_mult=4`、`sinkhorn_iters=20`，且 950 上要求 `c ∈ {4096, 7168}`（V4.1-Flash 的 `dim=5120` 当前不适用；A2/A3 要求 `c` 128 对齐）。工厂函数在 build 前校验这些条件，不满足时直接报错。与 `asc_sinkhorn` 同 target，互斥 |
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |
 | `engram.host_offload` | `HostEngramTable.Config`（精确匹配） | `HostOffloadEngramTable.Config` | CANN EngramFetch/EngramFetchGrad |
 | `engram.host_offload_mxfp8` | `HostEngramTable.Config`（精确匹配） | `MXFP8HostOffloadEngramTable.Config` | MXFP8 数据与 E8M0 scale |
@@ -459,8 +460,10 @@ torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn
 ```
 
 `deepseek_v4_1/` 没有 `__init__.py`：导入该 package 不注册任何 V4.1 override，每个入口
-只在 `override.imports` 按完整 `module.function` 列名导入时注册。`mhc` 下的两个入口
-只替换单个阶段，`HcPost` 的 kernel 调用因此要求显式的 `[B, T, D]` 流；`engram` 下的两个
+只在 `override.imports` 按完整 `module.function` 列名导入时注册。`mhc` 下的入口中，
+`asc_sinkhorn` 只替换 Sinkhorn 一个阶段，`asc_hc_premix` 替换整个 `HcPre.forward`
+（`asc_sinkhorn` 与 `asc_hc_premix` 同 target，互斥），`HcPost` 的 kernel
+调用因此要求显式的 `[B, T, D]` 流；`engram` 下的两个
 入口都要求 `num_max_tokens_per_rank`，取值需覆盖该次运行的最大 batch。启用方式见
 [V4.1 独立训练基线](../../examples/deepseek_v4_1/readme.md)。
 
