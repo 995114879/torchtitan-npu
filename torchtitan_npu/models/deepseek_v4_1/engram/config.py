@@ -9,6 +9,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
+from torchtitan.models.common.linear import Linear
 
 from .core import Engram, EngramContextGate
 from .host import HostEngramTable
@@ -18,7 +19,6 @@ if TYPE_CHECKING:
 
 _ENGRAM_TABLE_INIT = {"weight": partial(nn.init.normal_, std=1.0)}
 _ENGRAM_GATE_INIT = {
-    "wkv": partial(nn.init.trunc_normal_, std=0.02),
     "q_weight": nn.init.ones_,
     "k_weight": nn.init.ones_,
 }
@@ -69,6 +69,9 @@ def _make_engram_configs(
     engram: EngramArgs,
 ) -> dict[int, Engram.Config]:
     """Build all layer configs together so their prime table sizes are unique."""
+
+    from .. import _LINEAR_INIT
+
     if not engram.layer_ids or tuple(sorted(set(engram.layer_ids))) != engram.layer_ids:
         raise ValueError(f"Engram layer_ids must be non-empty, unique, and increasing, got {engram.layer_ids}.")
     if (
@@ -135,6 +138,12 @@ def _make_engram_configs(
                 memory_dim=memory_dim,
                 num_branches=hc_mult,
                 norm_eps=engram.norm_eps,
+                wkv=Linear.Config(
+                    in_features=memory_dim,
+                    out_features=hidden_size * (hc_mult + 1),
+                    bias=False,
+                    param_init=_LINEAR_INIT,
+                ),
                 param_init=_ENGRAM_GATE_INIT,
             ),
         )

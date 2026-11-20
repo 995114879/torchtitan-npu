@@ -101,8 +101,8 @@ class TestMuonPlacement:
         for fqn in (
             "layers.0.attention.wq_a.weight",
             "layers.0.attention.wkv.weight",
-            "layers.1.engram.gate.wkv",
-            "layers.14.engram.gate.wkv",
+            "layers.1.engram.gate.wkv.weight",
+            "layers.14.engram.gate.wkv.weight",
             "layers.0.moe.router.gate.weight",
             "layers.0.hc_attn_pre.hc_fn",
         ):
@@ -180,7 +180,7 @@ class TestRealModelReconciliation:
             prefix = f"layers.{layer_id}.engram"
             for suffix, expected in (
                 ("table.weight", "SparseAdam"),
-                ("gate.wkv", "DistMuon"),
+                ("gate.wkv.weight", "DistMuon"),
                 ("gate.q_weight", "AdamW"),
                 ("gate.k_weight", "AdamW"),
             ):

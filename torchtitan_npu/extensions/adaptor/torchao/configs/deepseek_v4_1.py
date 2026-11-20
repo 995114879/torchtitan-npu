@@ -28,7 +28,11 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 from ..filters import _match_fqn_suffix, any_config_filter
 from ..param_swaps import _hif8_param_swap, block_fp8_param_swap, mxfp8_param_swap
 from ..recipes import FilterSpec, ParamSwapSpec
-from .deepseek_v4 import _DENSE, _ROUTED, NpuQuantizedAscGroupedExpertsModule, _routed_expert_block_fp8
+from .deepseek_v4 import _DENSE as _DENSE_V4
+from .deepseek_v4 import _ROUTED, NpuQuantizedAscGroupedExpertsModule, _routed_expert_block_fp8
+
+# Compared with DeepSeek-V4, DeepSeek-V4.1 also need to quantize ".engram.gate.wkv"
+_DENSE = (*_DENSE_V4, ".engram.gate.wkv")
 
 
 def _is_v41_kv_source(config, fqn: str) -> bool:

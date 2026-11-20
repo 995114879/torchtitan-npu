@@ -20,8 +20,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+from torchtitan.models.common.linear import Linear  # noqa: TC002
 from torchtitan.protocols.module import Module
 
 
@@ -329,6 +329,7 @@ class EngramContextGate(Module):
         num_branches: int = 4
         norm_eps: float = 1e-5
         signed_sqrt_gate: bool = True
+        wkv: Linear.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -341,7 +342,7 @@ class EngramContextGate(Module):
         # the published model stores them, so its weights load without a
         # bespoke reshape, and it is one GEMM instead of a batched matmul plus
         # a linear.
-        self.wkv = torch.nn.Parameter(torch.empty(config.hidden_size * (config.num_branches + 1), config.memory_dim))
+        self.wkv = config.wkv.build()
         self.q_weight = torch.nn.Parameter(torch.empty(config.num_branches, config.hidden_size))
         self.k_weight = torch.nn.Parameter(torch.empty(config.num_branches, config.hidden_size))
 
@@ -350,7 +351,7 @@ class EngramContextGate(Module):
         hidden_states_BLMD: torch.Tensor,
         memory_BLE: torch.Tensor,
     ) -> torch.Tensor:
-        kv_BLX = F.linear(memory_BLE, _local_tensor(self.wkv))
+        kv_BLX = self.wkv(memory_BLE)
         keys_BLMD, values_BLD = kv_BLX.split([self.num_branches * self.hidden_size, self.hidden_size], dim=-1)
         # The inference reference accumulates the normalized dot product and
         # residual in FP32, with only the projection in the activation dtype.

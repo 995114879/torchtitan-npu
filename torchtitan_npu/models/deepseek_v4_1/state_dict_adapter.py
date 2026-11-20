@@ -72,7 +72,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
             "layers.{}.ffn.shared_experts.w2.weight": "layers.{}.moe.shared_experts.w2.weight",
             # Engram
             "layers.{}.engram.embed.weight": "layers.{}.engram.table.weight",
-            "layers.{}.engram.wkv.weight": "layers.{}.engram.gate.wkv",
+            "layers.{}.engram.wkv.weight": "layers.{}.engram.gate.wkv.weight",
             "layers.{}.engram.q_weight": "layers.{}.engram.gate.q_weight",
             "layers.{}.engram.k_weight": "layers.{}.engram.gate.k_weight",
             # mHC

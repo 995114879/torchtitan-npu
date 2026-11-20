@@ -316,8 +316,52 @@ def test_plan_from_recipe_first_matching_entry_wins(export, monkeypatch):
     }
 
 
+def test_recipe_plan_covers_the_engram_gate_weight(export, monkeypatch):
+    """PTQ must plan the Engram gate the training-side ``_DENSE`` quantizes.
+
+    Missing it exports the gate unquantized while ``config.json`` still records the
+    recipe as applied, so the gap is silent rather than an error.
+    """
+    filters = types.ModuleType("torchao_npu.quantization.filters")
+    # Same semantics as the real torchao_npu filters; only the matching matters here.
+    filters.match_fqn_suffix = lambda *sfx: (lambda p, fqn: any(fqn.endswith(s) for s in sfx))
+    filters.match_fqn_regex = lambda pat: (lambda p, fqn: re.match(pat, fqn) is not None)
+    filters.any_filter = lambda *fs: (lambda p, fqn: any(f(p, fqn) for f in fs))
+    tc = types.ModuleType("torchtitan_npu.extensions.adaptor.torchao.converter")
+    tc.mxfp8_param_swap = lambda: "MX"
+    tc.block_fp8_param_swap = lambda **kw: "BLOCK"
+    sys.modules["torchao_npu.quantization"].filters = filters
+    for name, mod in (
+        ("torchao_npu.quantization.filters", filters),
+        ("torchtitan_npu.extensions.adaptor.torchao.converter", tc),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    sd = {
+        "layers.0.attn.wkv.weight": torch.randn(2, 2),
+        "layers.1.engram.wkv.weight": torch.randn(2, 2),  # DeepSeek-V4.1 Engram gate
+        "layers.1.engram.embed.weight": torch.randn(2, 2),  # sparse table: never dense-quantized
+    }
+
+    for recipe in ("all_mxfp8", "mix", "all_block_fp8"):
+        plan = export.plan_from_recipe(sd, recipe=recipe, enable_mxfp4_qat=False, dst_type_max=0.0)
+        assert "layers.1.engram.wkv.weight" in plan, recipe
+        assert "layers.1.engram.embed.weight" not in plan, recipe
+
+
 def test_qwen35_quantized_fqn_is_already_in_memory_layout(export):
     fqn = "model.language_model.layers.0.self_attn.q_proj.weight"
+    tensor = torch.randn(2, 2)
+
+    out, quantized = export._to_in_memory_layout({fqn: tensor}, {fqn: 0})
+
+    assert out[fqn] is tensor
+    assert quantized == {fqn: 0}
+
+
+def test_engram_gate_weight_keeps_its_name_in_memory_layout(export):
+    """The Engram gate's ``to_hf`` name is already its in-memory name; it must not be renamed."""
+    fqn = "layers.1.engram.wkv.weight"
     tensor = torch.randn(2, 2)
 
     out, quantized = export._to_in_memory_layout({fqn: tensor}, {fqn: 0})

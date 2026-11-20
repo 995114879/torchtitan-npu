@@ -69,6 +69,10 @@ _DENSE_WEIGHT_SUFFIXES = (
     ".ffn.shared_experts.w1.weight",
     ".ffn.shared_experts.w2.weight",
     ".ffn.shared_experts.w3.weight",
+    # DeepSeek-V4.1 only (the training-side ``_DENSE`` also carries
+    # ``.engram.gate.wkv``); DeepSeek-V4 and V3.2 have no Engram tensors, so the
+    # suffix matches nothing there.
+    ".engram.wkv.weight",
 )
 _QWEN35_DENSE_WEIGHT_SUFFIXES = (
     ".self_attn.q_proj.weight",
@@ -85,6 +89,7 @@ _QWEN35_DENSE_WEIGHT_SUFFIXES = (
     ".mlp.down_proj.weight",
 )
 _QWEN35_HF_PREFIXES = ("model.language_model.",)
+_ENGRAM_WEIGHT_SUFFIXES = (".engram.wkv.weight",)
 _ROUTED_WEIGHT_PATTERN = r".*\.ffn\.experts\.\d+\.w[123]\.weight"
 
 # The converter's own recipe list also carries all_hif8, which this tool cannot export.
@@ -390,7 +395,8 @@ def _to_in_memory_layout(hf_state_dict, quantized_fqns):
     emitted that HF layout, so its non-quantized experts pass through unchanged.
     Dense weights are renamed to their in-memory FQNs (the quantized loader
     rebuilds each param from the metadata under the checkpoint's original key,
-    so these must be the final names).
+    so these must be the final names). Weights already under their in-memory name
+    — Qwen3.5's adapter output and ``_ENGRAM_WEIGHT_SUFFIXES`` — keep it.
     Returns ``(state_dict, final fqn -> applied ParamSwapConfig)``.
     """
     out = {k: v for k, v in hf_state_dict.items() if k not in quantized_fqns}
@@ -406,7 +412,10 @@ def _to_in_memory_layout(hf_state_dict, quantized_fqns):
                 new_quantized[new_key] = swap_config
                 break
         else:
-            if fqn.startswith(_QWEN35_HF_PREFIXES) and fqn.endswith(_QWEN35_DENSE_WEIGHT_SUFFIXES):
+            passthrough = fqn.endswith(_ENGRAM_WEIGHT_SUFFIXES) or (
+                fqn.startswith(_QWEN35_HF_PREFIXES) and fqn.endswith(_QWEN35_DENSE_WEIGHT_SUFFIXES)
+            )
+            if passthrough:
                 out[fqn] = hf_state_dict[fqn]
                 new_quantized[fqn] = swap_config
             else:

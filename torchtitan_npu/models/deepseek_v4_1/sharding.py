@@ -74,9 +74,9 @@ def set_engram_sharding_config(engram_cfg, *, enable_ep: bool, enable_sp: bool) 
     }
     engram_cfg.table.sharding_config = ShardingConfig(state_shardings=table_state)
 
+    engram_cfg.gate.wkv.sharding_config = _replicate_weight
     engram_cfg.gate.sharding_config = ShardingConfig(
         state_shardings={
-            "wkv": dense_param_rep,
             "q_weight": dense_param_rep,
             "k_weight": dense_param_rep,
         }

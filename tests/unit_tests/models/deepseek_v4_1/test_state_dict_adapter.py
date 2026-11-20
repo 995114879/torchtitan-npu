@@ -258,8 +258,9 @@ def test_engram_quantized_hf_mapping():
         }
     )
     torch.testing.assert_close(direct["layers.1.engram.table.weight"][:41], torch.full((41, 32), 4.0), rtol=0, atol=0)
-    torch.testing.assert_close(direct["layers.1.engram.gate.wkv"], gate, rtol=0, atol=0)
+    torch.testing.assert_close(direct["layers.1.engram.gate.wkv.weight"], gate, rtol=0, atol=0)
     round_trip = adapter.to_hf(direct)
+    torch.testing.assert_close(round_trip["layers.1.engram.wkv.weight"], gate, rtol=0, atol=0)
     torch.testing.assert_close(round_trip["layers.1.engram.q_weight"], torch.arange(12, dtype=torch.float32).view(3, 4))
     torch.testing.assert_close(round_trip["layers.1.engram.k_weight"], torch.full((3, 4), 0.5))
 

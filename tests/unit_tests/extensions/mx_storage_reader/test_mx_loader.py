@@ -166,9 +166,12 @@ def test_export_reader_rename_tables_are_inverses(ao_module, export_module):
         assert logical != hf, f"{pattern.pattern!r} does not rename its sample"
         back = [re.sub(p, t, logical, count=1) for p, t in export_module._LOGICAL_TO_HF if re.match(p, logical)]
         assert back == [hf]
-    # the dense-quant recipe filter names exactly the logical side of the table
+    # The dense-quant recipe filter names the logical side of the table plus the
+    # Engram weights that need no rename; a dense suffix that is neither would be
+    # quantized and then rejected by ``_to_in_memory_layout``, and a rename row
+    # missing from the filter would export unquantized in recipe mode.
     suffixes = {_sample(p).removeprefix("layers.7") for p, _ in export_module._LOGICAL_TO_HF}
-    assert suffixes == set(export_module._DENSE_WEIGHT_SUFFIXES)
+    assert suffixes | set(export_module._ENGRAM_WEIGHT_SUFFIXES) == set(export_module._DENSE_WEIGHT_SUFFIXES)
 
 
 _AO_FQN = "model.layers.0.self_attn.q_a_proj.weight"

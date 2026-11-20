@@ -89,7 +89,7 @@ def _official_demo_forward_reference(engram, hidden, input_ids, positions):
     memory = F.embedding(hashes, table.weight).flatten(2)
     D, M = engram.gate.hidden_size, engram.gate.num_branches
     # the fused projection holds each branch's key first, then the shared value
-    key_rows, value_rows = engram.gate.wkv.split([M * D, D], dim=0)
+    key_rows, value_rows = engram.gate.wkv.weight.split([M * D, D], dim=0)
     values = F.linear(memory, value_rows)
 
     gated = []
@@ -188,7 +188,7 @@ def test_bfloat16_gate_keeps_normalization_and_residual_in_fp32():
 
     actual = engram(hidden, input_ids)
     memory = F.embedding(_numpy_hash_reference(reference.table, input_ids), reference.table.weight).flatten(2)
-    kv = F.linear(memory.to(hidden.dtype), reference.gate.wkv).float()
+    kv = F.linear(memory.to(hidden.dtype), reference.gate.wkv.weight).float()
     keys, value = kv.split([32, 8], dim=-1)
     gated = []
     for branch, key in enumerate(keys.split(8, dim=-1)):
@@ -220,8 +220,8 @@ def test_zero_dot_gate_uses_positive_clamped_sqrt():
     engram = _build_engram()
     with torch.no_grad():
         engram.table.weight.fill_(1)
-        engram.gate.wkv.zero_()
-        engram.gate.wkv[-8:].fill_(1 / engram.gate.wkv.shape[1])
+        engram.gate.wkv.weight.zero_()
+        engram.gate.wkv.weight[-8:].fill_(1 / engram.gate.wkv.weight.shape[1])
         engram.gate.q_weight.zero_()
     hidden = torch.zeros(1, 2, 4, 8, requires_grad=True)
 
@@ -279,7 +279,7 @@ def test_image_tokens_reset_hash_history_and_receive_no_residual_gradient():
     torch.testing.assert_close(output[mask], hidden[mask], rtol=0, atol=0)
     output[mask].sum().backward()
     torch.testing.assert_close(hidden.grad[mask], torch.ones_like(hidden.grad[mask]))
-    assert torch.count_nonzero(engram.gate.wkv.grad) == 0
+    assert torch.count_nonzero(engram.gate.wkv.weight.grad) == 0
     assert torch.count_nonzero(engram.table.pending_sparse_grad().values()) == 0
 
 
