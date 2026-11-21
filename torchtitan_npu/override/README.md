@@ -174,7 +174,7 @@ Replacement 类采用「variant + target」命名，并保留标准缩写的大�
 | AscendC 实现 | `AscRMSNorm`、`AscComplexRoPE` |
 | Workaround 实现 | `WorkaroundComplexRoPE` |
 | 行为实现 | `VirtualOptimizersContainer` |
-| 后端协议或元数据 | `AscV4Metadata`、`AscBlockLayoutMetadata` |
+| 后端协议或元数据 | `AscV4Metadata`、`AicpuMetadata` |
 
 不作为公开 override 入口的内部函数和类使用前导下划线。
 
