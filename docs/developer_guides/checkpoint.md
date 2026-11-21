@@ -114,13 +114,14 @@ checkpoint = CheckpointManager.Config(
 
 ### 自动加载最新 checkpoint
 
-使用相同的 `--dump-folder` 和 `--checkpoint.folder` 重新启动，并启用 checkpoint：
+以下示例使用与前述保存示例相同的 DeepSeek V3 debug 模型和 tokenizer。加载时模型配置必须与 checkpoint 匹配。使用相同的 `--dump-folder` 和 `--checkpoint.folder` 重新启动，并启用 checkpoint：
 
 ```bash
 NGPU=1 \
-HF_ASSETS_PATH=/path/to/dsv4_tokenizer \
+MODULE=torchtitan.models.deepseek_v3 CONFIG=deepseek_v3_debugmodel \
 bash scripts/run_train.sh \
-  --dump-folder ./outputs/dsv4_checkpoint \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dump-folder ./outputs/dsv3_checkpoint \
   --checkpoint.enable \
   --checkpoint.folder checkpoint
 ```
@@ -130,8 +131,10 @@ bash scripts/run_train.sh \
 ### 指定加载步数
 
 ```bash
+MODULE=torchtitan.models.deepseek_v3 CONFIG=deepseek_v3_debugmodel \
 bash scripts/run_train.sh \
-  --dump-folder ./outputs/dsv4_checkpoint \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dump-folder ./outputs/dsv3_checkpoint \
   --checkpoint.enable \
   --checkpoint.load-step 100
 ```
@@ -143,21 +146,24 @@ step 目录。该参数必须使用绝对路径或远程 URI；相对路径会�
 
 ```bash
 NGPU=1 \
-HF_ASSETS_PATH=/path/to/dsv4_tokenizer \
+MODULE=torchtitan.models.deepseek_v3 CONFIG=deepseek_v3_debugmodel \
 bash scripts/run_train.sh \
-  --dump-folder ./outputs/dsv4_new_job \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dump-folder ./outputs/dsv3_new_job \
   --checkpoint.enable \
-  --checkpoint.initial-load-path /absolute/path/to/dsv4_checkpoint/checkpoint/step-100
+  --checkpoint.initial-load-path /absolute/path/to/dsv3_checkpoint/checkpoint/step-100
 ```
 
 默认只加载模型权重。若要加载优化器、学习率调度器和训练状态，应显式关闭
 `initial_load_model_only`：
 
 ```bash
+MODULE=torchtitan.models.deepseek_v3 CONFIG=deepseek_v3_debugmodel \
 bash scripts/run_train.sh \
-  --dump-folder ./outputs/dsv4_new_job \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dump-folder ./outputs/dsv3_new_job \
   --checkpoint.enable \
-  --checkpoint.initial-load-path /absolute/path/to/dsv4_checkpoint/checkpoint/step-100 \
+  --checkpoint.initial-load-path /absolute/path/to/dsv3_checkpoint/checkpoint/step-100 \
   --checkpoint.no-initial-load-model-only
 ```
 
@@ -167,10 +173,12 @@ bash scripts/run_train.sh \
 如只需要模型和部分训练状态，可以排除不需要的键：
 
 ```bash
+MODULE=torchtitan.models.deepseek_v3 CONFIG=deepseek_v3_debugmodel \
 bash scripts/run_train.sh \
-  --dump-folder ./outputs/dsv4_model_only \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dump-folder ./outputs/dsv3_model_only \
   --checkpoint.enable \
-  --checkpoint.initial-load-path /absolute/path/to/dsv4_checkpoint/checkpoint/step-100 \
+  --checkpoint.initial-load-path /absolute/path/to/dsv3_checkpoint/checkpoint/step-100 \
   --checkpoint.exclude-from-loading optimizer,lr_scheduler,dataloader
 ```
 
@@ -178,16 +186,17 @@ bash scripts/run_train.sh \
 
 从 HF safetensors 初始化时，需要启用 checkpoint、设置
 `--checkpoint.initial-load-in-hf`，并确保 `--checkpoint.initial-load-model-only` 保持
-为 `True`：
+为 `True`。以下使用 `deepseek_v4_debugmodel`，初始权重和 tokenizer 必须与该模型配置匹配；完整规格的 DeepSeek-V4 权重需要改用相应的模型配置和并行环境：
 
 ```bash
 NGPU=1 \
-HF_ASSETS_PATH=/path/to/dsv4_tokenizer \
+MODULE=torchtitan_npu.models.deepseek_v4 CONFIG=deepseek_v4_debugmodel \
 bash scripts/run_train.sh \
+  --hf-assets-path /path/to/dsv4_tokenizer \
   --dump-folder ./outputs/dsv4_from_hf \
   --checkpoint.enable \
   --checkpoint.initial-load-in-hf \
-  --checkpoint.initial-load-path /absolute/path/to/checkpoint/DeepSeek-V4
+  --checkpoint.initial-load-path /absolute/path/to/matching-dsv4-debug-hf
 ```
 
 如果不传 `--checkpoint.initial-load-path`，checkpoint 管理器会尝试使用模型配置中的
@@ -221,12 +230,13 @@ bash scripts/run_train.sh \
 ## 保存 Hugging Face 权重
 
 训练最后一步可以直接保存 HF safetensors。该模式只保存模型权重，不能作为完整训练
-断点使用：
+断点使用。以下示例使用 DeepSeek-V4 debug 配置及与其匹配的 tokenizer：
 
 ```bash
 NGPU=1 \
-HF_ASSETS_PATH=/path/to/dsv4_tokenizer \
+MODULE=torchtitan_npu.models.deepseek_v4 CONFIG=deepseek_v4_debugmodel \
 bash scripts/run_train.sh \
+  --hf-assets-path /path/to/dsv4_tokenizer \
   --dump-folder ./outputs/dsv4_hf \
   --checkpoint.enable \
   --checkpoint.last-save-in-hf \
@@ -241,12 +251,13 @@ bash scripts/run_train.sh \
 ## 创建 seed checkpoint
 
 seed checkpoint 用于先创建未应用并行切分的模型状态，再由多卡任务通过 DCP 重分片加载。
-创建时使用单卡，并将各并行度设为 `1`：
+以下使用 DeepSeek-V4 debug 配置与匹配的 tokenizer；创建时使用单卡，并将各并行度设为 `1`：
 
 ```bash
 NGPU=1 \
-HF_ASSETS_PATH=/path/to/dsv4_tokenizer \
+MODULE=torchtitan_npu.models.deepseek_v4 CONFIG=deepseek_v4_debugmodel \
 bash scripts/run_train.sh \
+  --hf-assets-path /path/to/dsv4_tokenizer \
   --dump-folder ./outputs/dsv4_seed \
   --checkpoint.enable \
   --checkpoint.create-seed-checkpoint \
