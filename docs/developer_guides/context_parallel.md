@@ -98,8 +98,14 @@ SWA 前缀交换是本仓扩展。
 布局还原、carry 与窗口交换各自独立：前者是置换，carry 只补一个压缩块，窗口交换允许重复使用 key。
 平坦化与窗口交换共用路由构造；carry 直接使用邻居关系。SWA 无需按窗口宽度额外 padding。
 
-arch22 + CP 下 `A3KeyWorkaround` 的压实行数是 device 值，与 `fullgraph=True` 的编译不兼容；栈在
-`parallelize` 里按 `is_a5() or cp <= 1` 关闭编译（`compile_policy.py`），退化为 eager 并告警。
+V4 常规 Trainer 启用模型编译（`--compile.enable --compile.components model`）时，按激活检查点策略决定编译顺序。
+在 A3 和 A5 上，FullAC 配合 CP>1 的 `doc_chunk` 或 `doc_zigzag` 时，先编译 TransformerBlock，
+再由 FullAC 重放整个 block，使各个 CP rank 按相同顺序参与通信。
+其他策略由上游处理。SelectiveAC 先包重计算再编译，关闭重计算时直接编译 block。
+V4 在 CP>1 下使用 Inductor 和 DeepEP 时，各 rank 先发起 attention 中的 CP 交换，再进入 MoE 的 DeepEP dispatch。
+即使某个 rank 只发不收，也要保持这个顺序，否则它可能先进入 DeepEP 建连，让同一 CP 组的接收方一直等待。
+A3 的 SelectiveAC 请保留默认的 all-to-all 保存项，避免反向重算时各 rank 的通信次数不同。
+A3 的 V4.1 在 CP>1 时仍使用 eager，并打印告警。
 
 ### 4.1 跨超节点：`--parallelism.extensions.context-parallel-intra-degree`
 
@@ -163,7 +169,7 @@ CP 的验收分三层，越往下越严格：
 - 判断一次改动是否中性，先用同一棵树确认「改动前后、同一配置」逐位相同，再谈跨 degree。
 
 arch22（910）没有确定性等级：跨 degree 不作为逐位判据，主要看「同一 degree、改动前后逐位」以及长跑 loss
-间距是否稳定；CP>1 时 `--compile.enable` 会被 `compile_policy` 关闭并告警。
+间距是否稳定。
 
 Engram 的取数用 `deepseek_v4_1_stripped`（released 几何 + debug Engram 表，只挂一层），同样需要镜像
 权重与两侧 level 3；逐行 history 由 shard 置换生成，跨 rank 不通信。
@@ -175,7 +181,7 @@ Engram 的取数用 `deepseek_v4_1_stripped`（released 几何 + debug Engram �
 | `models/deepseek_v4/cp_layout.py` | `doc_chunk` / `doc_zigzag` 的 LoadBalancer、置换与 `DocumentRanges` |
 | `models/deepseek_v4/metadata.py` | `KernelFrame`、`CPExchanges`（`xchg.cmp` / `xchg.swa`）、`DeepSeekV4Metadata`、`rebuild_cp_metadata` |
 | `models/deepseek_v4/context_parallel.py` | CPAttention 组装 SWA 窗口；CPCompressor 还原 slab 与 ratio-4 carry；配置转换 |
-| `models/deepseek_v4/compile_policy.py` | arch22 + CP 时关闭编译 |
+| `models/deepseek_v4/parallelize.py` | V4 常规 Trainer 的 CP + FullAC 编译顺序 |
 | `override/deepseek_v4*/` | 融合后端、量化 adaptor、A3 前缀压紧 |
 
 ## 8. 相关文档

@@ -3,22 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Whether a fused DeepSeek stack can be compiled at this degree, and what to say when it cannot.
-
-arch22's fused attention and selector size their kernel options by a **device** row count -- the key
-compaction is a ``nonzero`` -- so a compiled region cannot guard on it
-(``Could not guard on data-dependent expression``, raised from inside the vendor op's meta
-function).  There is nowhere to break the graph either: torchtitan compiles every TransformerBlock
-with ``fullgraph=True``, and under full activation checkpointing the block is traced inside the
-``checkpoint`` higher-order operator, which admits no break of its own.
-
-arch35 reads ``seqused``, its metadata carries no device row count, and it compiles as usual; a
-single degree moves nothing, so ``CP=1`` compiles on every architecture.
-
-So the stack states the fact where its degree and its arch are both known -- in the model's
-``parallelize`` -- and the flag stays accepted, which is what lets one recipe serve both
-architectures: on A5 it compiles, on arch22 it warns once and runs eagerly.
-"""
+"""Default compile policy when using the upstream block wrapping order."""
 
 from dataclasses import replace
 
@@ -47,9 +32,7 @@ def skip_compile_under_cp(model, compile_config, parallel_dims, *, a5: bool | No
     if not compile_config.enable or compiles_under_cp(parallel_dims, a5=a5):
         return compile_config
     logger.warning(
-        "Skipping torch.compile for %s: arch22's fused kernels read device row counts under context "
-        "parallel, so a block cannot be one graph. Running eagerly; --compile.enable stays accepted "
-        "so one recipe serves both architectures.",
+        "Skipping torch.compile for %s: this arch22 context-parallel configuration runs eagerly.",
         type(model).__name__,
     )
     return replace(compile_config, enable=False)

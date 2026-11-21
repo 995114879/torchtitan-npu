@@ -156,3 +156,27 @@ def test_layers_that_must_not_emit_a_teacher(monkeypatch, mode):
         # Eval has no indexer gradient to feed, so the carrier is not threaded through and
         # SMLAG never emits a teacher on it.
         assert scores.grad is None
+
+
+def test_smla_compiles_with_variable_cp_window_rows(monkeypatch):
+    def smla(q, *, ori_kv, **kwargs):
+        # Match the CANN meta kernel's nonempty-input check on the packed window.
+        if ori_kv.numel() == 0:
+            raise ValueError("empty window")
+        return q + ori_kv.sum(), q.new_zeros((1, q.size(0), 1))
+
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla", smla)
+    config = _config(ratio=0)
+    attention = _attention(config)
+    metadata = _metadata(config, torch.arange(4))
+    q = torch.zeros(1, 4, 1, 4)
+    keys = torch.arange(32, dtype=torch.float32).view(8, 4)
+
+    @torch.compile(backend="eager", fullgraph=True)
+    def attend(window):
+        return attention(q, keys.index_select(0, window).unsqueeze(0), torch.zeros(1), attention_metadata=metadata)
+
+    for rows in (4, 6):
+        window = torch.arange(rows)
+        torch._dynamo.decorators.mark_unbacked(window, 0)
+        torch.testing.assert_close(attend(window), torch.full_like(q, keys[:rows].sum()))

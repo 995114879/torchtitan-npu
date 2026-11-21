@@ -32,9 +32,8 @@ per pair of kernels, one field per direction::
     attached.  Under context parallelism its ``prepare_cp_metadata`` rebuilds the frames, AI_CPU
     metadata and proof for this rank.
 
-The compressor has no frames here: the ratio-4 overlap's carry is applied outside the compressor
-(``models/deepseek_v4/context_parallel.ContextParallelCompressor``), which builds the augmented
-boundaries and the kernel's state table at the call site and passes them as arguments.  The
+The CP metadata holds the restored compressor slab's document boundaries, including the ratio-4
+carry. The CP compressor exchanges the carry and the fused kernel builds its state table. The
 quantized indexer is another backend: it owns a metadata class of its own (a subclass of this
 one) and rebuilds the indexer group with its own contract.  Nothing here knows about
 quantization.

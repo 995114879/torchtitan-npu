@@ -88,7 +88,7 @@ class Compressor(Module):
     @staticmethod
     def _overlap_transform(
         state: torch.Tensor,
-        first_indices: torch.Tensor,
+        first_mask: torch.Tensor,
         *,
         value: float,
     ) -> torch.Tensor:
@@ -113,7 +113,6 @@ class Compressor(Module):
         # aot_autograd recompute and its data-dependent guard trips make_fx.
         prev_idx = (torch.arange(n_blocks, device=state.device) - 1).clamp_min(0)
         state_a = state[:, prev_idx, :, :head_dim]
-        first_mask = torch.zeros(n_blocks, dtype=torch.bool, device=state.device).scatter(0, first_indices, True)
         state_a = torch.where(first_mask.view(1, -1, 1, 1), state.new_full((1,), value), state_a)
         state_b = state[:, :, :, head_dim:]
         return torch.cat([state_a, state_b], dim=2)
@@ -172,9 +171,11 @@ class Compressor(Module):
                     "the ratio-4 overlap needs the local stream's cu_seqlens: the first block of "
                     "every document has no predecessor block to borrow."
                 )
-            first_indices = (cu_seqlens[:-1] // ratio).to(torch.int64)
-            score = self._overlap_transform(score, first_indices, value=float("-inf"))
-            kv = self._overlap_transform(kv, first_indices, value=0.0)
+            # Mark a block if any of its tokens starts a document (including the CP carry).
+            starts = torch.zeros(length, dtype=torch.bool, device=x.device).scatter(0, cu_seqlens[:-1].long(), True)
+            first_mask = starts.view(n_blocks, ratio).any(dim=1)
+            score = self._overlap_transform(score, first_mask, value=float("-inf"))
+            kv = self._overlap_transform(kv, first_mask, value=0.0)
 
         # -- softmax pool + norm + RoPE (RoPE owns the [nope | rope] split) --
         # The gate is a softmax over the block's pooled rows: ``ratio`` of them, or ``2 * ratio``

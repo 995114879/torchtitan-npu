@@ -71,6 +71,10 @@ class DeepSeekV41Metadata(DeepSeekV4Metadata):
     a rank-local row; a context-parallel run stops here before any layer executes.
     """
 
+    def _local_compressor_boundaries(self, width: int, rank: int) -> None:
+        # V4.1 pools directly from its compressed-key frame.
+        return None
+
     @staticmethod
     def prepare_cp_metadata(
         attention_metadata: DeepSeekV4Metadata,

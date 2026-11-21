@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
@@ -23,9 +25,9 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.compile import (
     apply_compile as apply_graph_trainer_compile,
 )
+from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
 from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 
-from torchtitan_npu.models.deepseek_v4.compile_policy import skip_compile_under_cp
 from torchtitan_npu.patches.torch.distributed.fsdp import policy_overrides
 
 from .lora import is_lora_parameter
@@ -121,7 +123,28 @@ def parallelize_deepseek_v4(
     decoder_fsdp=None,
 ):
     """Apply DSV4 parallelism with per-parameter FP32 SmoE policies."""
-    compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
+    if (
+        compile_config.enable
+        and "model" in compile_config.components
+        and compile_config.backend == "inductor"
+        and parallel_dims.cp > 1
+        and parallel_dims.ep_enabled
+        and any(
+            isinstance(getattr(module, "token_dispatcher", None), DeepEPTokenDispatcher) for module in model.modules()
+        )
+    ):
+        from .deepep_order import install_cp_deepep_order
+
+        install_cp_deepep_order(parallel_dims.get_mesh("cp").get_group().group_name)
+    if (
+        compile_config.enable
+        and "model" in compile_config.components
+        and parallel_dims.cp > 1
+        and isinstance(ac_config, FullAC.Config)
+    ):
+        # Compiling the FullAC wrapper can prune the recomputed exchange on ranks with empty receives.
+        apply_compile(model, compile_config=compile_config, parallel_dims=parallel_dims)
+        compile_config = replace(compile_config, enable=False)
     with policy_overrides(_dsv4_fp32_overrides(model, training)), _decoder_fsdp_binding(decoder_fsdp):
         parallelized_model = parallelize_deepseekv3(
             model,

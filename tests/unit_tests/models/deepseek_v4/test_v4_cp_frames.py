@@ -28,7 +28,7 @@ from torch import nn
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.compressor import Compressor
 from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelCompressor
-from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer
+from torchtitan_npu.models.deepseek_v4.cp_layout import DocChunkCPLoadBalancer, DocZigZagCPLoadBalancer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4.asc_metadata import AicpuGeometry, AscV4Metadata
 
@@ -107,6 +107,24 @@ def _gather_of(entry, stream: str) -> torch.Tensor | None:
 def _kernel_grid(reach: torch.Tensor, row: torch.Tensor) -> torch.Tensor:
     """The frame the kernels are handed for a stream whose reach is ``reach``."""
     return row if _IS_A5 else _prefix(reach)
+
+
+@pytest.mark.parametrize("balancer", [DocChunkCPLoadBalancer, DocZigZagCPLoadBalancer])
+@pytest.mark.parametrize("ratio, rank1", [(4, [0, 4, 516, 1028]), (128, [0, 512, 1024])])
+def test_compressor_boundaries_follow_the_restored_slab(balancer, ratio, rank1):
+    positions = _positions(512, 512, 512, 512)
+    row = _row(positions, ratio=ratio)
+    permutation = balancer.Config().build(seq_len=2048, cp_size=2, attention_metadata=row).generate_permutation()
+    for rank, expected in enumerate(([0, 512, 1024], rank1)):
+        local = row.per_doc_cp_metadata(
+            permutation=permutation,
+            cp_size=2,
+            cp_rank=rank,
+            window_size=_WINDOW,
+            zigzag=balancer is DocZigZagCPLoadBalancer,
+        )
+        assert local.xchg is not None and local.xchg.compressor_cu_seqlens is not None
+        torch.testing.assert_close(local.xchg.compressor_cu_seqlens, torch.tensor(expected, dtype=torch.int32))
 
 
 @pytest.mark.parametrize("ratio", [0, 4])

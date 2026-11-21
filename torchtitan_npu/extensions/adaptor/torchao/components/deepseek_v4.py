@@ -25,7 +25,7 @@ from torchao_npu.quantization.quant_configs import (
     HiF8QuantizeConfig,
     MXQuantizeConfig,
 )
-from torchao_npu.quantization.quant_primitives.mx import mx_fake_quantize
+from torchao_npu.quantization.quant_primitives.mx import mx_last_dim_fake_quantize
 from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.config import derive
 from torchtitan.protocols.module import Module
@@ -412,13 +412,16 @@ def _dynamic_norm_class(owner: type[Module]) -> type[Module]:
             if x.shape[-1] != self.head_dim:
                 raise ValueError(f"{type(self).__name__} expects a width-{self.head_dim} input, got {tuple(x.shape)}")
             y = super().forward(x)
-            return torch.cat(
-                [
-                    mx_fake_quantize(y[..., : self.nope_head_dim], -1, self.fake_quant_config),
-                    y[..., self.nope_head_dim :],
-                ],
-                dim=-1,
+            config = self.fake_quant_config
+            nope = mx_last_dim_fake_quantize(
+                y[..., : self.nope_head_dim],
+                config.npu_elem_dtype,
+                config.block_size,
+                config.round_mode,
+                config.scale_alg,
+                config.dst_type_max,
             )
+            return torch.cat((nope, y[..., self.nope_head_dim :]), dim=-1)
 
     FakeQuantizedNorm.__name__ = FakeQuantizedNorm.__qualname__ = f"FakeQuantized{owner.__name__}"
     _DYNAMIC_NORM_CLASS_CACHE[owner] = FakeQuantizedNorm

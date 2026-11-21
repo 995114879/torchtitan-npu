@@ -176,6 +176,8 @@ class _SparseMLA(torch.autograd.Function):
             ratio=ratio,
             window_size=window_size,
         )
+        # The CP window has at least one key for every nonempty query chunk.
+        torch._check(swa_k.size(0) > 0)
         output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
             q,
             ori_kv=swa_k,

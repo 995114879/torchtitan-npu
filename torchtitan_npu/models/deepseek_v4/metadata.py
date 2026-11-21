@@ -111,10 +111,19 @@ class WindowMetadata:
         )
 
 
+def compressor_boundaries(cu_seqlens: torch.Tensor, *, width: int, rank: int, ratio: int) -> torch.Tensor:
+    """Document boundaries of the restored flat slab, including the ratio-4 predecessor block."""
+    start = rank * width - (ratio if rank and ratio == 4 else 0)
+    end = (rank + 1) * width
+    inside = cu_seqlens[(cu_seqlens > start) & (cu_seqlens < end)] - start
+    return torch.cat((inside.new_zeros(1), inside, inside.new_full((1,), end - start))).to(torch.int32)
+
+
 @dataclass(frozen=True, kw_only=True, slots=True)
 class CPExchanges:
     cmp: FlattenMetadata
     swa: WindowMetadata
+    compressor_cu_seqlens: torch.Tensor | None = None
 
 
 for metadata_type in (KernelFrame, FlattenMetadata, WindowMetadata, CPExchanges):
@@ -198,6 +207,11 @@ class DeepSeekV4Metadata:
             return build(local)
         return replace(local, head=build(local.head), tail=build(local.tail))
 
+    def _local_compressor_boundaries(self, width: int, rank: int) -> torch.Tensor | None:
+        if self.ratio <= 1:
+            return None
+        return compressor_boundaries(self.cu_seqlens, width=width, rank=rank, ratio=self.ratio)
+
     def per_doc_cp_metadata(
         self, *, permutation: torch.Tensor, cp_size: int, cp_rank: int, window_size: int, zigzag: bool = False
     ) -> Self:
@@ -229,6 +243,8 @@ class DeepSeekV4Metadata:
             local,
             xchg=CPExchanges(
                 cmp=FlattenMetadata.build(permutation, cp_size=cp_size, cp_rank=cp_rank),
+                # Both compressors in a block need the same data-dependent document count.
+                compressor_cu_seqlens=self._local_compressor_boundaries(width, cp_rank),
                 swa=WindowMetadata.build(
                     permutation, self.cu_seqlens, head=head, tail=tail, window_size=window_size, cp_rank=cp_rank
                 ),
@@ -238,7 +254,7 @@ class DeepSeekV4Metadata:
     def mark_dynamic(self) -> None:
         """Mark batch-dependent leading dimensions so Dynamo does not specialize.
 
-        The document boundaries, the frames, ``position_k`` and both exchange tables follow the
+        The document boundaries, the frames and the SWA window indices follow the
         packing; the arch22 workaround and the selector's forward record are marked when this
         stack carries them.
         """
@@ -257,11 +273,9 @@ class DeepSeekV4Metadata:
         if workaround is not None:
             tensors += [gather for gather in (workaround.swa_k_gather, workaround.cmp_k_gather) if gather is not None]
         if self.xchg is not None:
-            # Both tables follow the rank-local sequence length, and so does the slab whose
-            # positions the compressor rotates.
-            tensors += [self.position_k, self.xchg.cmp.recv_index]
-            if self.xchg.cmp.send_index is not None:
-                tensors.append(self.xchg.cmp.send_index)
+            # The slab width is fixed, but its document count and SWA halo vary with packing.
+            if self.xchg.compressor_cu_seqlens is not None:
+                tensors.append(self.xchg.compressor_cu_seqlens)
             tensors += [self.xchg.swa.send_index, self.xchg.swa.head_index]
             if self.xchg.swa.tail_index is not None:
                 tensors.append(self.xchg.swa.tail_index)

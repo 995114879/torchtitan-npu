@@ -336,6 +336,24 @@ def test_sparse_attention_component_triggers_on_real_v41_filters(converter_modul
     assert "has no sparse_attention filter" not in caplog.text
 
 
+def test_v4_kv_norm_fake_quant_traces_with_dynamic_sequence():
+    from torchao_npu.quantization.quant_configs import MXQuantizeConfig
+    from torchtitan.models.common import RMSNorm
+
+    from torchtitan_npu.extensions.adaptor.torchao.components.deepseek_v4 import FakeQuantizedNormFactory
+
+    norm = FakeQuantizedNormFactory.Config(
+        norm=RMSNorm.Config(normalized_shape=512),
+        _fake_quant_config=MXQuantizeConfig(block_size=64),
+        head_dim=512,
+        nope_head_dim=448,
+    ).build()
+    graph = torch.export.export(
+        norm, (torch.randn(1, 17, 512),), dynamic_shapes=({1: torch.export.Dim("seq", min=2)},), strict=True
+    ).graph
+    assert any(node.target == torch.ops.torchao_npu.mx_last_dim_fake_quantize.default for node in graph.nodes)
+
+
 def test_model_type_rejects_unknown_model_spec_name(converter_module):
     with pytest.raises(ValueError, match=r"supports DeepSeek V4, DeepSeek V4\.1 and Qwen3\.5 model specs"):
         converter_module._model_type_for_spec(SimpleNamespace(name="deepseek_v3", model=object()))

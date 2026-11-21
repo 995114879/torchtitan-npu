@@ -88,9 +88,8 @@ class AscCompressor(CompressorImplementation):
             coff=1 + int(compressor.overlap),
             cache_mode=1,
         )
-        # The kernel may allocate capacity beyond this stream's blocks; the kept blocks are
-        # this stream's own count, expressed with its shape symbol rather than a host value.
-        pooled = compressor.norm(pooled[: x.shape[1] // ratio].to(x.dtype))
+        # CANN allocates at least this many rows. narrow keeps the exact block count in the backward graph.
+        pooled = compressor.norm(pooled.narrow(0, 0, x.shape[1] // ratio).to(x.dtype))
         return (
             compressor.rope(pooled.unsqueeze(0).unsqueeze(2), positions=positions[..., ::ratio])
             .squeeze(0)

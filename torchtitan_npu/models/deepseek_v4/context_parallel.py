@@ -17,6 +17,7 @@ from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.deepseek_v4.attention import Attention
 from torchtitan_npu.models.deepseek_v4.compressor import Compressor
+from torchtitan_npu.models.deepseek_v4.metadata import compressor_boundaries
 from torchtitan_npu.models.deepseek_v4_1.attention import Attention as Attention41
 from torchtitan_npu.models.deepseek_v4_1.compressor import Compressor as Compressor41
 
@@ -181,7 +182,7 @@ class ContextParallelCompressor(ContextParallelCompressorMixin, Compressor):
         positions = torch.cat((positions.new_zeros((positions.size(0), carry.size(1))), positions), dim=1)
         return x, positions, carry.size(1)
 
-    def _prepare_input(self, x, positions, cu_seqlens):
+    def _prepare_input(self, x, positions, cu_seqlens, local_cu_seqlens=None):
         """The stream this rank pools: its slab, plus the block the ratio-4 pool reaches back for.
 
         The ratio-4 window needs one block before the slab, and on a rank whose slab starts
@@ -198,17 +199,19 @@ class ContextParallelCompressor(ContextParallelCompressorMixin, Compressor):
         carry_length = 0
         if self.compress_ratio == 4:
             x, positions, carry_length = self._prepend_carry(x, positions)
-        global_start = group.get_local_rank() * local_length - carry_length
-        input_length = local_length + carry_length
-        inside = cu_seqlens[(cu_seqlens > global_start) & (cu_seqlens < global_start + input_length)] - global_start
-        bounds = torch.cat((inside.new_zeros(1), inside, inside.new_full((1,), input_length))).to(torch.int32)
-        return x, positions, bounds, carry_length // self.compress_ratio
+        if local_cu_seqlens is None:
+            local_cu_seqlens = compressor_boundaries(
+                cu_seqlens, width=local_length, rank=group.get_local_rank(), ratio=self.compress_ratio
+            )
+        return x, positions, local_cu_seqlens, carry_length // self.compress_ratio
 
     def forward(self, x, positions, *, cu_seqlens=None, attention_metadata=None):
         if attention_metadata is None:
             return super().forward(x, positions, cu_seqlens=cu_seqlens)
-        x = self._restore_flat_input(x, None if attention_metadata.xchg is None else attention_metadata.xchg.cmp)
-        x, positions, cu_seqlens, trim = self._prepare_input(x, positions, cu_seqlens)
+        xchg = attention_metadata.xchg
+        x = self._restore_flat_input(x, None if xchg is None else xchg.cmp)
+        local_cu = None if xchg is None else xchg.compressor_cu_seqlens
+        x, positions, cu_seqlens, trim = self._prepare_input(x, positions, cu_seqlens, local_cu)
         pooled = super().forward(x, positions, cu_seqlens=cu_seqlens)
         return pooled.narrow(1, trim, pooled.size(1) - trim)
 
