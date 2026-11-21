@@ -113,7 +113,8 @@ A5 脚本默认启用 block-FP8；如需 BF16，请在命令末尾追加后文�
 
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --checkpoint.folder ./export_ckpt \
+  --dump-folder "$PWD/export_ckpt" \
+  --checkpoint.folder checkpoint \
   --checkpoint.enable \
   --checkpoint.no-load-only \
   --checkpoint.last-save-in-hf \
@@ -122,13 +123,14 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
   --debug.deterministic
 ```
 
-从导出的 HF checkpoint 冷启动时，使用新的或空的 `checkpoint.folder`，避免已有 step checkpoint 优先触发 resume：
+导出结果位于 `$PWD/export_ckpt/checkpoint/step-1`。从该 HF checkpoint 冷启动时，使用新的或空的输出目录，避免已有 step checkpoint 优先触发 resume：
 
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --checkpoint.folder ./load_ckpt \
+  --dump-folder "$PWD/load_ckpt" \
+  --checkpoint.folder checkpoint \
   --checkpoint.enable \
-  --checkpoint.initial-load-path ./export_ckpt/checkpoint/step-1 \
+  --checkpoint.initial-load-path "$PWD/export_ckpt/checkpoint/step-1" \
   --checkpoint.initial-load-in-hf \
   --training.steps 1 \
   --debug.seed 42 \
