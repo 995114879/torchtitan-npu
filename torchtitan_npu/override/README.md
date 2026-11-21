@@ -241,7 +241,11 @@ Checkpoint manager 的 NPU 替换与文件级 SHA-256 manifest 校验不再是 o
 ```
 
 开启后保存会生成 `_checkpoint_hash_manifest.json`，加载会在物化 checkpoint state 前验证
-清单。数据流与限制见
+清单。校验启用时，缺少清单会抛出 `FileNotFoundError`；存在
+`_checkpoint_hash_manifest.pending` 标记时会抛出 `CheckpointManifestError`，
+不会继续加载该 checkpoint。
+
+数据流与限制见
 [Virtual Optimizer 特性说明](../../docs/feature_guides/virtual_optimizer.md)。
 
 ### Common
