@@ -12,6 +12,7 @@ pytestmark = [
 ]
 
 
+@pytest.mark.triton_ascend
 def test_merged_gdn_forward_backward():
     from torchtitan_npu.ops.triton.gdn import gated_delta_rule
 

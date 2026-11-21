@@ -4,10 +4,19 @@
 # LICENSE file in the root directory of this source tree.
 
 
-"""Shared pytest fixtures for the smoke tests under tests/smoke_tests."""
+"""Shared pytest options and fixtures for smoke tests."""
 
 import pytest
 import torch
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--run-unsupported-triton",
+        action="store_true",
+        default=False,
+        help="Run Triton smoke cases despite the known Torch >= 2.14 C++17/C++20 launcher incompatibility.",
+    )
 
 
 @pytest.fixture(scope="session")

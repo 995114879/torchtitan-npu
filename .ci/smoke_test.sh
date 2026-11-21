@@ -11,22 +11,10 @@ set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
 
-# Tests that the 2026-09-29 CI image cannot run yet. They are deselected here
-# instead of patched in the repo; drop a deselect once its toolchain issue is
-# fixed.
-#   * tests/smoke_tests/ops/test_mhc_triton.py (26 cases): triton-ascend
-#     hardcodes -std=c++17 when it builds its NPU host stub / precompiled
-#     header, while torch >= 2.14 refuses anything below C++20
-#     (ATen/ATen.h:5), so every Triton kernel launch fails to compile.
-#   * test_qwen3_5_npu_runtime.py::test_merged_gdn_forward_backward uses the
-#     same Triton host-stub compiler and fails with the same C++17/C++20 error.
-SMOKE_DESELECT=(
-    --deselect tests/smoke_tests/ops/test_mhc_triton.py
-    --deselect tests/smoke_tests/ops/test_qwen3_5_npu_runtime.py::test_merged_gdn_forward_backward
-)
+# Version-scoped Triton skips are applied by tests/smoke_tests/conftest.py.
 
 SMOKE_TESTS_START="$(date +%s)"
-"${PYTHON_BIN}" -m pytest -v --tb=short "${SMOKE_DESELECT[@]}" tests/smoke_tests
+"${PYTHON_BIN}" -m pytest -v --tb=short -rs tests/smoke_tests "$@"
 SMOKE_TESTS_END="$(date +%s)"
 
 echo "tests.smoke_tests finished in $((SMOKE_TESTS_END - SMOKE_TESTS_START))s"

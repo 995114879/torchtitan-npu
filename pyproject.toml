@@ -29,6 +29,7 @@ pythonpath = ["."]
 markers = [
     "cpu: CPU-only unit test",
     "smoke: NPU smoke test",
+    "triton_ascend: NPU smoke case requiring the Triton-Ascend Torch launcher",
     "static: source and declaration contract test",
     "tooling: repository tooling or skill self-test; excluded from product UT coverage",
 ]

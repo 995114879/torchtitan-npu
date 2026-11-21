@@ -50,7 +50,7 @@ from torchtitan_npu.override.deepseek_v4.mhc.triton import (
     TritonHcPre,
 )
 
-pytestmark = pytest.mark.smoke
+pytestmark = [pytest.mark.smoke, pytest.mark.triton_ascend]
 
 _BATCH = 1
 _SEQ_LEN = 96
