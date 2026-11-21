@@ -67,6 +67,7 @@ torchtitan_npu/override/
 ├── a3_workaround.py
 ├── common/
 │   ├── __init__.py
+│   ├── activation_checkpoint.py
 │   ├── optimizer.py
 │   ├── rms_norm.py
 │   ├── rope.py
@@ -90,7 +91,7 @@ torchtitan_npu/override/
 │   │   ├── ascendc.py
 │   │   ├── pypto.py
 │   │   └── pypto_pro.py
-│   ├── metadata.py
+│   ├── asc_metadata.py
 │   ├── mhc/
 │   │   ├── __init__.py
 │   │   ├── ascendc.py
@@ -102,6 +103,7 @@ torchtitan_npu/override/
 │       ├── __init__.py
 │       └── ascendc.py
 └── qwen3_5/
+    ├── fla.py
     ├── gated_delta.py
     ├── parallelize.py
     └── varlen_attention.py
@@ -120,7 +122,6 @@ torchtitan_npu/override/deepseek_v4_1/
 ├── lightning_indexer/
 │   ├── __init__.py
 │   └── ascendc.py
-├── metadata.py
 ├── mhc.py
 ├── sparse_attn/
 │   ├── __init__.py
@@ -254,6 +255,7 @@ Checkpoint manager 的 NPU 替换与文件级 SHA-256 manifest 校验不再是 o
 
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
+| `activation_checkpoint.update_save_ops` | `SelectiveAC.Config` | `SelectiveACWithSaveOpEdits.Config` | 在 selective activation checkpointing 的保存集合中增删算子；`edits` 形如 `+torch.ops.aten.bmm.default` / `-torch.ops.aten.mm.default`，默认空表（安装即 no-op）。需与 `activation-checkpoint:selective` 子命令同时使用 |
 | `optimizer.virtual` | `OptimizersContainer.Config` | `VirtualOptimizersContainer.Config` | 将 Adam/AdamW 的 `exp_avg` 和 `exp_avg_sq` 放入 NPU swap memory |
 | `optimizer.cpu_offload` | `OptimizersContainer.Config` | `CpuOffloadOptimizersContainer.Config` | optimizer 规范状态保留在 CPU，更新在 NPU 上执行；要求 `--training.enable-cpu-offload` |
 | `optimizer.swap_optimizer` | `OptimizersContainer.Config` | `OptimizerStateSwapContainer.Config` | 统一 offload 策略入口：已设 `--training.enable-cpu-offload` 时转发 `cpu_offload`，否则将 optimizer state 放入 NPU swap memory |
@@ -348,7 +350,10 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | SMLA/SMLAG；SMLAG 反向在 `topk_scores` 梯度上产出 indexer teacher |
+| `compressor.asc` | `CompressorImplementation.Config` | `AscCompressor.Config` | 使用 CANN 融合 DeepSeek-V4 compressor；A5 示例脚本默认启用 |
 | `lightning_indexer.asc` | `InnerIndexer.Config` | `AscInnerIndexer.Config` | 融合 LI 选分与 SLIKG 反向；消费 `topk_scores` 上的 teacher |
+| `lightning_indexer.pypto` | `InnerIndexer.Config` | `PyPTOInnerIndexer.Config` | 与 `lightning_indexer.asc` 同一契约的 PyPTO 实现；需额外安装与当前 CANN 匹配的 `pypto` runtime |
+| `lightning_indexer.pypto_pro` | `InnerIndexer.Config` | `PyPTOProInnerIndexer.Config` | PyPTO-Pro 实现的 LI 选分与 SLIKG 反向；同样需 `pypto` runtime |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.tilelang_hc_pre` | `HcPre.Config` | `TilelangHcPre.Config` | 使用外部 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
@@ -360,6 +365,7 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `moe.tilelang_swiglu_grouped` | `GroupedExperts.Config` | `TilelangGroupedExperts.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
 | `moe.tilelang_swiglu_shared` | `FeedForward.Config` | `TilelangFeedForward.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
 | `moe_router.tilelang` | `HashRouter.Config`（精确匹配） | `TilelangHashRouter.Config` | 非 hash 层使用 TileKernels `topk_gate`；hash 层保持原逻辑 |
+| `chat_dataloader.sft` | `AlignedHuggingfaceDataloader.Config`（`fqns=["dataloader"]`，精确匹配） | `DeepSeekV4ChatDataLoader.Config` | 使用结构化 DeepSeek-V4 chat 数据做 SFT（按文档对齐）；要求 `--dataloader.dataset-path` 指向 JSONL/JSON |
 
 `sparse_attn.asc` 支持记录几何参数（`num_heads`/`head_dim`/`index_num_heads`/`index_head_dim`
 默认 `64`/`512`/`64`/`128`，即 V4-Flash 的发布形状；debug/pro 等其它宽度在同一个入口上给出，例如
@@ -383,8 +389,9 @@ entry，因此没有跨几何查找、也没有 `plan_for` 之类的守卫。LI 
 （`torchao_npu.quantized_modules.deepseek_v4.QuantizedV4SparseAttention`），它替换融合核的
 config、用 `quant_lightning_indexer_metadata` 构建自己的 entry（其记录契约不属于本 port，CP
 下由它自己的 `prepare_cp_metadata` 按 rank-local frames 重建）。`override/` 与 `models/` 都不知道
-量化存在。CP 下由 `AscV4Metadata.prepare_cp_metadata` 调 `shard_compressed_varlen_metadata`
-按 rank-local 行重建 plan，再在其上重填记录（upstream PR #4617）；参考契约的 hook 直接拒绝 CP。
+量化存在。CP 下由 `AscV4Metadata.prepare_cp_metadata` 调
+`attention_metadata.rebuild_cp_metadata` 按 rank-local 行重建 plan，再在其上重填记录
+（upstream PR #4617）；参考契约的 hook 直接拒绝 CP。
 compressor 的状态表由**融合 attention 的 metadata 构建器**在 eager 边界写进 plan（表宽随 batch 的
 文档走，不能在建图时构），因此选 `sparse_attn.asc` 就带上了它，不再有独立的 compressor 状态表入口。非融合的 attention backend（参考核）不建表，压缩器在 forward 里按当前 batch 自行构表（eager 下逐
 batch 正确；只有「参考 attention + 融合 compressor + 图训练」这一组合目前没有 recipe 使用）。CV 的 metadata 重切不再是一个配置节点：启用
@@ -453,8 +460,11 @@ kernel；使用它需要额外安装与当前 CANN 匹配的 `pypto` runtime，�
 | `mhc.asc_sinkhorn` | `HcPre.Config`（精确匹配） | `AscV41HcPre.Config` | 仅融合 Sinkhorn，保留调用方的 pre mix |
 | `mhc.asc_hc_premix` | `HcPre.Config`（精确匹配） | `AscV41HcPrePremix.Config` | 融合 Sinkhorn 与压流，算子 `mhc_pre_sinkhorn_premix`。**约束**：仅 A5（`premix` 输入）、`hc_mult=4`、`sinkhorn_iters=20`，且 950 上要求 `c ∈ {4096, 7168}`（V4.1-Flash 的 `dim=5120` 当前不适用；A2/A3 要求 `c` 128 对齐）。工厂函数在 build 前校验这些条件，不满足时直接报错。与 `asc_sinkhorn` 同 target，互斥 |
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |
+| `tilelang.tilelang_hc_pre` | `HcPre.Config`（精确匹配） | `TilelangV41HcPre.Config` | 单趟 mHC pre，由 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` 完成 |
+| `tilelang.tilelang_hc_post` | `HcPost.Config`（精确匹配） | `TilelangV41HcPost.Config` | 由外部 TileKernels `mhc_post` 算子完成 mHC post；与 `mhc.asc_hc_post` 同 target，互斥 |
 | `engram.host_offload` | `HostEngramTable.Config`（精确匹配） | `HostOffloadEngramTable.Config` | CANN EngramFetch/EngramFetchGrad |
 | `engram.host_offload_mxfp8` | `HostEngramTable.Config`（精确匹配） | `MXFP8HostOffloadEngramTable.Config` | MXFP8 数据与 E8M0 scale |
+| `engram.shard_over_efsdp` | `HostEngramTable.Config`（精确匹配） | `HostEngramTable.Config` | 将 Host Engram 表与 SparseAdam 状态按 EFSDP 与 EP 联合分片 |
 | `vision_language_dataloader.sft` | `DeepSeekV41DataLoader.Config`（`fqns=["dataloader"]`） | V4.1 结构化多模态 SFT dataloader | 数据行不覆盖 `thinking_mode` 等策略字段 |
 
 ```text
@@ -574,6 +584,20 @@ CPU 测试用 eager 替身覆盖这条边：整模型前反向跑通后逐个断
 （`tests/unit_tests/override/deepseek_v4_1/test_lightning_indexer_fused.py`）。替身验证的
 是模型侧的搬运契约，SMLAG、SLIKG 和 LI 算子本身没有在 CPU 上执行过；NPU 上的数值和
 是否真的产生非零梯度仍需在设备上确认。
+
+### Qwen3.5
+
+以下入口省略 `torchtitan_npu.override.qwen3_5.` 前缀：
+
+| 入口 | Target | Replacement | 说明 |
+| --- | --- | --- | --- |
+| `fla.operators` | `GatedDeltaNet.Config`（精确匹配） | `FLAGatedDeltaNet.Config` / `ContextParallelGatedDeltaNet.Config` / `FLAConvContextParallelGatedDeltaNet.Config` | 使用官方 FLA 的 GDN 与可选卷积；`context_parallel` / `causal_conv1d` / `force_fp32` 三个关键字参数决定落到哪个 replacement。`force_fp32` 只提升算子输入的 dtype，参数与返回激活保持配置 dtype |
+| `gated_delta.triton` | `GatedDeltaKernel.Config`（精确匹配） | `TritonGatedDeltaKernel.Config` | 使用 Triton-Ascend GDN kernel |
+| `gated_delta.npu` | `GatedDeltaKernel.Config`（精确匹配） | `TritonGatedDeltaKernel.Config` | 不依赖 FLA 的 NPU GDN kernel，卷积换成 NPU 实现；replacement 与 `gated_delta.triton` 同类，二者按 kernel 二选一 |
+| `gated_delta.context_parallel` | `GatedDeltaNet.Config`（精确匹配） | `ContextParallelGatedDeltaNet.Config` | Triton GDN + Context Parallel；同时把 kernel 派生为 `TritonGatedDeltaKernel.Config` |
+| `varlen_attention.asc_cp` | `VarlenAttention.Config`（`fqns=["model_spec.model.layers.*.attention.inner_attention"]`，精确匹配） | `AscVarlenAttention.Config` | 使用 CANN TND attention 支持 Qwen3.5/3.6 Context Parallel |
+
+`gated_delta.triton` 与 `gated_delta.npu` 声明同一个 `GatedDeltaKernel.Config` 节点，不能同时启用。
 
 ## Override 与 package patch
 
