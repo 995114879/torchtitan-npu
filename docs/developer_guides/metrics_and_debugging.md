@@ -109,8 +109,10 @@ python3 scripts/parse_profiling_data.py path/to/save_traces_folder
 
 - `kernel_details.csv`：NPU kernel 级别的耗时统计
 - `api_statistic.csv`：PyTorch API 调用统计
-- `ascend_pytorch_profiler_0.db`：可用 MindStudio Insight 或 Chrome Tracing 打开的 SQLite 格式 trace
-- `trace_view.json`：完整的 trace 视图数据
+- `ascend_pytorch_profiler_0.db`：SQLite 格式性能分析数据库，可用 MindStudio Insight 或数据库工具查看
+- `trace_view.json`：JSON 格式时间线数据，可用 MindStudio Insight、`chrome://tracing/` 或 `https://ui.perfetto.dev/` 打开
+
+两类产物及查看方式参见 [Ascend PyTorch Profiler 输出结果说明](https://www.hiascend.com/document/detail/zh/mindstudio/latest/msTT_msIT/ascend_pytorch_profiler/docs/zh/ascend_pytorch_profiler/ascend_pytorch_profiler_user_guide.md)。
 
 ### 配置示例
 
