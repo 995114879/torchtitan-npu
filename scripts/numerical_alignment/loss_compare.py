@@ -531,17 +531,18 @@ def compare_metric(
     test_extra_steps = tuple(sorted(test_steps - expected))
     errors: list[tuple[int, float, float, float, float]] = []
     first_mismatch: dict[str, float | int] | None = None
+    has_nonfinite = False
 
     for step in sorted(baseline_steps & test_steps):
         baseline_value = baseline[step]
         test_value = test[step]
         finite = math.isfinite(baseline_value) and math.isfinite(test_value)
+        has_nonfinite |= not finite
         abs_diff = abs(test_value - baseline_value) if finite else math.inf
-        denominator = max(abs(baseline_value), RELATIVE_ERROR_FLOOR)
-        rel_diff = abs_diff / denominator
+        rel_diff = abs_diff / max(abs(baseline_value), RELATIVE_ERROR_FLOOR) if finite else math.inf
         errors.append((step, baseline_value, test_value, abs_diff, rel_diff))
 
-        if mode == "bitwise" and first_mismatch is None and not (finite and test_value == baseline_value):
+        if first_mismatch is None and (not finite or (mode == "bitwise" and test_value != baseline_value)):
             first_mismatch = {
                 "step": step,
                 "baseline": baseline_value,
@@ -563,8 +564,10 @@ def compare_metric(
     effective_thresholds = thresholds if mode == "close" else BITWISE_THRESHOLDS
     limits = asdict(effective_thresholds)
     failed_metrics = tuple(name for name, value in values.items() if value > limits[name])
+    if has_nonfinite:
+        failed_metrics += ("non_finite",)
 
-    if mode == "close" and failed_metrics and errors:
+    if mode == "close" and failed_metrics and errors and first_mismatch is None:
         if "max_re" in failed_metrics:
             mismatch = next(item for item in errors if item[4] > thresholds.max_re)
         elif "mean_ae" in failed_metrics:

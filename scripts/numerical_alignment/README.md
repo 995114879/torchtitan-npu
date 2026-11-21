@@ -161,6 +161,7 @@ python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
 
 默认在 `outputs/compare_results/` 下创建独立结果目录，可用 `--output-dir` 指定空目录或尚不存在的目录。
 控制台实时打印 seed 创建和两次训练日志，结束时打印误差摘要及 `PASS` / `FAIL`，详细结果写入 `comparison.json`。两侧指标须完整覆盖 `1..steps`；通过返回 `0`，否则返回 `1`。
+任一侧的 `loss` 或 `grad_norm` 含 NaN 或 Inf 时，该指标判为 `FAIL`，并在 `failed_metrics` 中记录 `non_finite`，不受容差设置影响。近似比较同时存在超差和非有限值时，`first_mismatch` 优先记录首个非有限值所在的 step。
 
 报告的 `baseline.npu_processes` / `test.npu_processes` 记录启动配置：`override` 为显式卡数覆盖值，`ngpu_env` 为传给 runner 的 `NGPU`（未设置时为 `null`），`source` 为 `override`、`environment` 或 `runner`。runner 可在内部覆盖环境变量，因此这些字段不代表实际运行卡数；`source=runner` 时由脚本自行决定。
 
