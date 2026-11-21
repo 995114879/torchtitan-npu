@@ -110,7 +110,7 @@ pip install -e .
     </tr>
     <!-- 并行能力 -->
     <tr>
-      <td rowspan="4">并行能力</td>
+      <td rowspan="5">并行能力</td>
       <td>4D 并行 (FSDP2/TP/CP/PP)</td>
       <td>✅</td>
       <td>✅</td>
@@ -129,6 +129,11 @@ pip install -e .
       <td><a href="docs/feature_guides/deepep.md">DeepEP（MoE dispatch/combine）</a></td>
       <td>✅</td>
       <td>✅</td>
+    </tr>
+    <tr>
+      <td><a href="docs/feature_guides/moonep.md">MoonEP</a></td>
+      <td>❌</td>
+      <td>✅（Ascend 950）</td>
     </tr>
     <!-- 图编译能力 -->
     <tr>

@@ -40,11 +40,13 @@ argument's dtype. This is at least as precise as the upstream
 fp32-score-multiply + bf16 ``scatter_add``.
 """
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import spmd_types as spmd
 import torch
+import torch.distributed as dist
 import torch_npu
 from torchtitan.config import derive, override
 from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
     from torch.distributed.device_mesh import DeviceMesh
 
+    from torchtitan_npu.ops.ascendc import moonep
     from torchtitan_npu.ops.ascendc.deepep import (
         DispatchHandle,
         ElasticBufferHandle,
@@ -194,9 +197,6 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
         When ``ep_mesh`` is None (EP=1), returns the local permute result
         directly with ``LocalDispatchMetadata`` — no all-to-all.
-
-        With SP, x_TD/topk_scores_TK/topk_expert_ids_TK are already
-        the local SP shard (from DTensor Shard to_local via LocalMapConfig).
 
         Args:
             x_TD: ``(T, D)`` local token shard
@@ -402,7 +402,7 @@ class DispatchState:
 class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
     """Use a process-global CANN ElasticBuffer on its exclusive DeepEP communication domain."""
 
-    _buffer: ClassVar["ElasticBuffer | None"] = None
+    _buffers: ClassVar[dict[tuple["ProcessGroup", int, int, int, int], "ElasticBuffer"]] = {}
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepEPTokenDispatcher.Config):
@@ -434,21 +434,22 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         num_max_tokens_per_rank: int,
         top_k: int,
     ) -> tuple["ElasticBuffer", "ProcessGroup"]:
-        """Resolve the DeepEP group and create the process-global buffer."""
+        """Reuse buffers with the same communication group, device and capacity."""
         deepep_group = get_deepep_group(ep_mesh)
-
-        if cls._buffer is not None:
-            return cls._buffer, deepep_group
+        key = (deepep_group, torch_npu.npu.current_device(), hidden_dim, num_max_tokens_per_rank, top_k)
+        if key in cls._buffers:
+            return cls._buffers[key], deepep_group
 
         from cann_ops_transformer import ElasticBuffer
 
-        cls._buffer = ElasticBuffer(
+        buffer = ElasticBuffer(
             deepep_group,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             hidden=hidden_dim,
             num_topk=top_k,
         )
-        return cls._buffer, deepep_group
+        cls._buffers[key] = buffer
+        return buffer, deepep_group
 
     def init_buffer(self) -> None:
         """Initialize the process-global ElasticBuffer on the dispatcher's exclusive EP group."""
@@ -470,14 +471,14 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         self._deepep_group = deepep_group
         self._deepep_world_size = deepep_group.size()
 
-    def _dispatch_activation_exchange(self, x_td, topk_expert_ids_tk, topk_scores_tk):
+    def _dispatch_activation_exchange(self, x_td, topk_expert_ids_tk, topk_scores_tk, *, num_experts: int):
         """Communication seam shared by high-precision and quantized dispatchers."""
         recv_payload, recv_scores, counts, handle = torch.ops.deepep.dispatch(
             [x_td],
             topk_expert_ids_tk,
             topk_scores_tk,
-            self.num_experts,
-            self.num_experts // self._deepep_world_size,
+            num_experts,
+            num_experts // self._deepep_world_size,
             self._deepep_buffer_handle,
         )
         return recv_payload[0], recv_scores, counts, handle
@@ -491,6 +492,17 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         num_local_tokens_per_expert_E: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, "DispatchState"]:
         del num_local_tokens_per_expert_E
+        return self.dispatch_experts(x_TD, topk_scores_TK, topk_expert_ids_TK, num_experts=self.num_experts)
+
+    def dispatch_experts(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        *,
+        num_experts: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, "DispatchState"]:
+        """Use the existing transport for real or virtual expert identifiers."""
         topk_expert_ids_TK = topk_expert_ids_TK.to(torch.int32).contiguous()
         topk_scores_TK = topk_scores_TK.float().contiguous()
         (
@@ -502,6 +514,7 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
             x_TD,
             topk_expert_ids_TK,
             topk_scores_TK,
+            num_experts=num_experts,
         )
         return (
             hidden_states_RD,
@@ -545,6 +558,142 @@ class AscDeepEPTokenDispatcher(DeepEPTokenDispatcher):
         return combined_td
 
 
+@dataclass(kw_only=True, slots=True)
+class MoonEPDispatchState(DispatchState):
+    """DeepEP dispatch state, MoonEP plan and this call's staged expert weights."""
+
+    virtual_ids: torch.Tensor
+    cu_seqlens: torch.Tensor
+    experts_to_copy: torch.Tensor
+    staged_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+class AscMoonEPTokenDispatcher(AscDeepEPTokenDispatcher):
+    """Add MoonEP planning and weight transport to the NPU DeepEP path."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(AscDeepEPTokenDispatcher.Config):
+        pass
+
+    _contexts: ClassVar[dict[tuple["ProcessGroup", int, int, int], "moonep.MoonEPContextHandle"]] = {}
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.expert_hidden_dim = config.expert_hidden_dim
+        self.context: moonep.MoonEPContextHandle | None = None
+
+    def init_buffer(self) -> None:
+        if self.ep_mesh is None or self.ep_mesh.size() <= 1:
+            raise ValueError("MoonEP requires expert_parallel_degree > 1.")
+        hidden_dim = self.hidden_dim
+        expert_hidden_dim = self.expert_hidden_dim
+        if hidden_dim is None or expert_hidden_dim is None:
+            raise ValueError("MoonEP requires hidden_dim and expert_hidden_dim to size its communication buffer.")
+        width = hidden_dim * expert_hidden_dim
+        num_ranks = self.ep_mesh.size()
+        super().init_buffer()
+        key = (
+            self._deepep_group,
+            torch_npu.npu.current_device(),
+            self.num_experts,
+            width,
+        )
+        if key not in self._contexts:
+            from ops import moonep_context  # pyrefly: ignore [missing-import]
+            from torch_npu._C._distributed_c10d import ProcessGroupHCCL  # pyrefly: ignore [missing-import]
+
+            from torchtitan_npu.ops.ascendc import moonep
+
+            num_local_experts = self.num_experts // num_ranks
+            # Reserve 3 weight groups (w1/gate, w3/up, w2/down), 1 reusable communication slot,
+            # and gradient storage sized for FP32 (4 bytes/element).
+            need = moonep_context.HEAP_BASE + moonep_context.reduce_region_end(
+                num_ranks, num_local_experts, width, num_groups=3, slots=1, grad_bytes_per_elem=4
+            )
+            options = ProcessGroupHCCL.Options()
+            # The backend's memory test reports usable heap bytes at about twice
+            # the configured MiB; divide by two and keep 2 MiB of config headroom.
+            options.hccl_config = {"hccl_buffer_size": math.ceil(need / (2 * 1024**2)) + 2}
+            # Weight transport must not share ElasticBuffer's communicator/heap.
+            context_group = dist.new_group(
+                ranks=dist.get_process_group_ranks(self._deepep_group),
+                backend="hccl",
+                group_desc="asc_moonep_weights",
+                use_local_synchronization=True,
+                pg_options=options,
+            )
+            context = moonep_context.create_moonep_context(group=context_group)
+            # ElasticBuffer already exists; context creation checked isolation,
+            # and this private weight group is never used by ElasticBuffer.
+            # Skip plan's redundant GC scan: isinstance on an expired weak proxy
+            # can raise ReferenceError during compiled execution.
+            context.eb_scan_done = True
+            moonep_context.check_heap_capacity(context, need, "MoonEP weights and FP32 gradient slots")
+            # The backend context retains context_group through its group attribute.
+            self._contexts[key] = moonep.MoonEPContextHandle(context)
+        self.context = self._contexts[key]
+
+    # pyrefly: ignore [bad-override]
+    def dispatch(
+        self,
+        x_TD: torch.Tensor,
+        topk_scores_TK: torch.Tensor,
+        topk_expert_ids_TK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+        *,
+        expert_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, MoonEPDispatchState]:
+        """Plan virtual experts, prefetch weights, then dispatch tokens."""
+        from torchtitan_npu.ops.ascendc import moonep
+
+        assert self.context is not None and self.ep_mesh is not None
+        virtual_ids, cu_seqlens, experts_to_copy = moonep.plan(
+            num_local_tokens_per_expert_E,
+            topk_expert_ids_TK,
+            self.ep_mesh.size(),
+            self.context,
+        )
+        # Keep prefetch and token dispatch separate for future stream overlap.
+        with maybe_set_sparse_mesh():
+            staged_weights = self.prefetch_expert_weights(expert_weights, experts_to_copy)
+        recv, counts, metadata = super().dispatch_experts(
+            x_TD,
+            topk_scores_TK,
+            virtual_ids,
+            num_experts=2 * self.num_experts,
+        )
+        return (
+            recv,
+            counts,
+            MoonEPDispatchState(
+                virtual_ids=virtual_ids,
+                cu_seqlens=cu_seqlens,
+                experts_to_copy=experts_to_copy,
+                staged_weights=staged_weights,
+                recv_scores=metadata.recv_scores,
+                handle=metadata.handle,
+                routed_scores_R=metadata.routed_scores_R,
+            ),
+        )
+
+    def prefetch_expert_weights(
+        self,
+        weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        experts_to_copy: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prefetch the supplied BF16 local SPMD gate/up/down weights."""
+        from torchtitan_npu.ops.ascendc import moonep
+
+        assert self.context is not None
+        return moonep.prefetch_weight(
+            weights[0].contiguous(),
+            weights[1].contiguous(),
+            weights[2].contiguous(),
+            experts_to_copy,
+            self.context,
+        )
+
+
 @override(
     target=AllToAllTokenDispatcher.Config,
     exact=True,
@@ -569,3 +718,21 @@ def asc_deepep(
     if isinstance(cfg, AscDeepEPTokenDispatcher.Config):
         return cfg
     return derive(cfg, AscDeepEPTokenDispatcher.Config)
+
+
+@override(
+    target=DeepEPTokenDispatcher.Config,
+    description=(
+        "Use MoonEP planning and weight transport on the NPU DeepEP path; "
+        "requires the existing EP process-group integration"
+    ),
+)
+def asc_moonep(cfg: DeepEPTokenDispatcher.Config) -> AscMoonEPTokenDispatcher.Config:
+    """Select MoonEP transport; the expert implementation is chosen separately.
+
+    MoonEP does not support PP, TP or quantized dispatch/combine.
+    """
+    # TorchAO converts before overrides; derive would discard its quantized transport.
+    if hasattr(cfg, "mxfp8_quant_params"):
+        raise ValueError("MoonEP does not support quantized dispatch/combine; disable all_to_all_quant_format.")
+    return derive(cfg, AscMoonEPTokenDispatcher.Config)

@@ -361,11 +361,16 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
 
 
 class DeepEPTokenDispatcher(TorchTitanDeepEPTokenDispatcher):
-    """Expose the absorption setting for backend-specific DeepEP dispatchers."""
+    """Expose score absorption and expert width for backend-specific DeepEP dispatchers."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(TorchTitanDeepEPTokenDispatcher.Config):
         absorb_router_scores: bool = False
+        # MoonEP sizes its private HCCL symmetric heap in ``init_buffer`` during
+        # parallelize and only sees this config, so ``make_routed_experts_config``
+        # (the sole pre-override place seeing both it and ``inner_experts.hidden_dim``)
+        # fills the width here. Plain DeepEP ignores it.
+        expert_hidden_dim: int | None = None
 
     def __init__(self, config: Config):
         super().__init__(config)

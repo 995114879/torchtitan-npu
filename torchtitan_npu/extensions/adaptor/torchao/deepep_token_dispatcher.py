@@ -148,7 +148,7 @@ def get_mxfp8_deepep_dispatcher_cls(parent_cls: type) -> type:
                 raise ValueError("MXFP8 DeepEP requires block_size=32")
             self.mxfp8_quant_params = config.mxfp8_quant_params
 
-        def _dispatch_activation_exchange(self, x_td, topk_expert_ids_tk, topk_scores_tk):
+        def _dispatch_activation_exchange(self, x_td, topk_expert_ids_tk, topk_scores_tk, *, num_experts: int):
             # Transport produces detached payloads; the Function below owns the
             # logical activation/score VJP. Keep the original x and scores for apply.
             # This also avoids requiring autograd formulas on raw FP8/uint8 ops.
@@ -158,8 +158,8 @@ def get_mxfp8_deepep_dispatcher_cls(parent_cls: type) -> type:
                     [qdata, scale],
                     topk_expert_ids_tk,
                     topk_scores_tk,
-                    self.num_experts,
-                    self.num_experts // self._deepep_world_size,
+                    num_experts,
+                    num_experts // self._deepep_world_size,
                     self._deepep_buffer_handle,
                 )
                 recv_qdata, recv_scale = recv_payload

@@ -25,6 +25,11 @@ tokens and is a plain parameter the MoE balancing hook never updates, and
 the reference's descending selection order, since the pinned router selects
 unsorted.
 
+Dispatchers exposing ``prefetch_expert_weights`` receive the current expert
+weights through ``dispatch`` and return staged weights in their metadata.
+This keeps dispatcher and expert overrides independent; other dispatchers
+keep the direct expert call.
+
 ``config_utils`` is deliberately imported inside ``apply()``, after the
 class swaps, so its module-level imports bind the patched classes — keep
 the swap-then-import order.
@@ -39,6 +44,7 @@ import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
+from torch.func import functional_call
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_size
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.feed_forward import FeedForward
@@ -314,6 +320,14 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
         topk_scores_TK = topk_scores_BLK.view(T, K)
         topk_expert_ids_TK = topk_expert_ids_BLK.view(T, K)
         dispatcher = self.token_dispatcher
+        # Pass weights so dispatcher and expert overrides remain independent.
+        dispatch_kwargs = {}
+        if hasattr(dispatcher, "prefetch_expert_weights"):
+            dispatch_kwargs["expert_weights"] = (
+                self.inner_experts.w1_EFD,
+                self.inner_experts.w3_EFD,
+                self.inner_experts.w2_EDF,
+            )
         (
             routed_input_RD,
             num_global_tokens_per_local_expert_e,
@@ -323,17 +337,30 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
             topk_scores_TK,
             topk_expert_ids_TK,
             num_local_tokens_per_expert_E,
+            **dispatch_kwargs,
         )
         # Patch override: consume scores carried by dispatcher metadata and pass
         # them into grouped experts before the down projection.
         routed_scores_R = getattr(metadata, "routed_scores_R", None)
+        staged_weights = getattr(metadata, "staged_weights", None)
 
         with maybe_set_sparse_mesh():
-            routed_output_RD = self.inner_experts(
-                routed_input_RD,
-                num_global_tokens_per_local_expert_e,
-                routed_scores_R=routed_scores_R,
-            )
+            if staged_weights is None:
+                routed_output_RD = self.inner_experts(
+                    routed_input_RD,
+                    num_global_tokens_per_local_expert_e,
+                    routed_scores_R=routed_scores_R,
+                )
+            else:
+                # functional_call(module, substitutions, args, kwargs)
+                staged_weights = dict(zip(("w1_EFD", "w3_EFD", "w2_EDF"), staged_weights, strict=True))
+                routed_output_RD = functional_call(
+                    self.inner_experts,
+                    staged_weights,
+                    (routed_input_RD, num_global_tokens_per_local_expert_e),
+                    {"routed_scores_R": routed_scores_R},
+                    strict=False,
+                )
 
         combine_kwargs = {}
         if num_local_tokens_after_seq_dim_padding is not None:
@@ -454,6 +481,12 @@ def _clamp_make_routed_experts_config(
         dispatcher_config = dataclasses.replace(
             dispatcher_config,
             absorb_router_scores=absorb_router_scores,
+        )
+    if "expert_hidden_dim" in dispatcher_fields:
+        # Weight-transport dispatchers size their heap from the expert FFN width.
+        dispatcher_config = dataclasses.replace(
+            dispatcher_config,
+            expert_hidden_dim=cfg.inner_experts.hidden_dim,
         )
     inner_experts = cfg.inner_experts
     if isinstance(inner_experts, _ClampGroupedExperts.Config):
