@@ -1,0 +1,50 @@
+name: lite-ci-dispatcher-smoke
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Smoke profile to run'
+        type: choice
+        options: ['dispatch_smoke']
+        default: 'dispatch_smoke'
+        required: false
+  workflow_call:
+    inputs:
+      profile:
+        description: 'Smoke profile to run'
+        type: string
+        required: false
+        default: 'dispatch_smoke'
+permissions:
+  repository: read
+  note: read
+  action: read
+  project: read
+jobs:
+  smoke:
+    name: Dispatcher Smoke
+    runs-on: [ubuntu-latest, x64, small]
+    timeout-minutes: 180
+    env:
+      CI_SMOKE_PROFILE: ${{ inputs.profile }}
+      CI_RESULT_AUTHOR: ${{ vars.LITE_CI_RESULT_ACTOR }}
+      CI_SOURCE_SHA: ${{ atomgit.event.pull_request.head.sha || atomgit.sha }}
+    steps:
+      - name: Checkout
+        identifier: source
+        uses: checkout
+        with:
+          ref: ${{ atomgit.event.pull_request.head.sha || atomgit.sha }}
+      - name: Set up Python
+        uses: setup-python
+        with:
+          python-version: '3.12'
+      - name: Wait for Lite Actions
+        env:
+          CI_GITCODE_TOKEN: ${{ atomgit.token }}
+        run: |
+          cd "${{ steps.source.outputs.path }}"
+          test "$(git rev-parse HEAD)" = "$CI_SOURCE_SHA"
+          export CI_SMOKE_PROFILE="${CI_SMOKE_PROFILE:-dispatch_smoke}"
+          export CI_RESULT_AUTHOR="${CI_RESULT_AUTHOR:-depeng1994}"
+          PYTHONPATH="$PWD" python3 -m tests.integration_tests.tools.lite_actions.entrypoint wait-gitcode

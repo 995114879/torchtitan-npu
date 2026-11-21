@@ -7,7 +7,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 __all__ = [
     "OverrideDefinitions",
@@ -42,6 +42,8 @@ class OverrideDefinitions:
     required_env: Sequence[str] = ()
     check_grad_norm: bool = False
     unset_env: Sequence[str] = ()
+    ci_kind: str = "train"
+    ci_overrides: Mapping[str, str] = field(default_factory=dict)
 
     def __repr__(self):
         return self.test_descr

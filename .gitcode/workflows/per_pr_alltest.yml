@@ -1,0 +1,22 @@
+name: lite-ci-per-pr-alltest
+# TODO: replace the Smoke profile with the full PR test suite.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Smoke profile to run'
+        type: choice
+        options: ['dispatch_smoke']
+        default: 'dispatch_smoke'
+        required: false
+# The caller grants its local reusable workflow read access to the run and commit comments.
+permissions:
+  repository: read
+  note: read
+  action: read
+  project: read
+jobs:
+  per_pr:
+    uses: ./.gitcode/workflows/dispatcher_smoke.yml
+    with:
+      profile: ${{ inputs.profile }}

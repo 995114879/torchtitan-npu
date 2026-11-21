@@ -13,11 +13,14 @@ TensorBoard assertions live here, never SSH/resource scheduling.
 from __future__ import annotations
 
 import argparse
-from dataclasses import replace
 import json
 import os
+import subprocess
+import sys
+from dataclasses import replace
 from pathlib import Path
-from tests.integration_tests import OverrideDefinitions
+
+from tests.integration_tests import OverrideDefinitions  # noqa: TC001 - retain runtime annotation resolution
 
 
 def dispatcher_port_env() -> dict[str, str]:
@@ -40,6 +43,67 @@ def dispatcher_port_env() -> dict[str, str]:
                 raise ValueError(f"invalid dispatcher-issued {key}")
             overrides[target] = raw
     return overrides
+
+
+def run_dispatch_smoke(test: OverrideDefinitions) -> None:
+    """Launch a small HCCL collective without loading model/checkpoint assets."""
+    nodes = int(os.environ.get("NNODES", str(test.nnodes)))
+    node_ips = [value.strip() for value in os.environ.get("NODE_IPS", "").split(",") if value.strip()]
+    if nodes != test.nnodes or (nodes > 1 and len(node_ips) != nodes) or (node_ips and len(node_ips) != nodes):
+        raise RuntimeError(f"smoke topology mismatch: nodes={nodes}, ips={node_ips}")
+    if os.environ.get("NGPU", str(test.ngpu)) != str(test.ngpu):
+        raise RuntimeError(f"smoke expects NGPU={test.ngpu}")
+    if "NODE_RANK" in os.environ:
+        node_rank = int(os.environ["NODE_RANK"])
+    elif nodes == 1:
+        node_rank = 0
+    else:
+        raise RuntimeError("multi-node smoke requires dispatcher-assigned NODE_RANK")
+    if not 0 <= node_rank < nodes:
+        raise RuntimeError(f"invalid NODE_RANK={node_rank} for {nodes} nodes")
+
+    if os.environ.get("LITE_CI_JOB_ID") and (
+        not node_ips
+        or any(
+            not os.environ.get(name)
+            for name in (
+                "MASTER_PORT",
+                "HCCL_IF_BASE_PORT",
+                "HCCL_HOST_SOCKET_PORT_RANGE",
+                "HCCL_NPU_SOCKET_PORT_RANGE",
+            )
+        )
+    ):
+        raise RuntimeError("CI smoke requires the complete dispatcher port lease and NODE_IPS")
+    port = os.environ.get("MASTER_PORT")
+    if nodes > 1 and not port:
+        raise RuntimeError("multi-node smoke requires an explicit MASTER_PORT; no automatic port allocation")
+    timeout = test.timeout or 7200
+    if type(timeout) is not int or not 1 <= timeout <= 14400:
+        raise ValueError("invalid execution timeout")
+    env = {**os.environ, "OMP_NUM_THREADS": "1"}
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nnodes",
+        str(nodes),
+        "--nproc-per-node",
+        str(test.ngpu),
+        "--node-rank",
+        str(node_rank),
+    ]
+    if not port:
+        cmd.append("--standalone")
+    else:
+        env["MASTER_ADDR"] = node_ips[0] if node_ips else "127.0.0.1"
+        cmd.extend(["--master-addr", env["MASTER_ADDR"], "--master-port", port])
+    cmd.extend(["-m", "tests.integration_tests.training_cases.dispatch_smoke"])
+    print("[DISPATCH_SMOKE_LAUNCH] " + " ".join(cmd), flush=True)
+    try:
+        subprocess.run(cmd, env=env, check=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"dispatch smoke exceeded {timeout}-second execution budget") from exc
 
 
 def prepare_launch(test: OverrideDefinitions, output_dir: Path) -> tuple[OverrideDefinitions, Path]:
@@ -98,9 +162,9 @@ def verify(test: OverrideDefinitions, *, output_dir: Path) -> None:
     Finite metrics are completion checks, not a numerical/performance baseline.
     """
     from tests.integration_tests.loss_compare import (
+        TB_LOSS_TAG,
         compare_checkpoint_metrics,
         extract_scalar_from_tensorboard,
-        TB_LOSS_TAG,
     )
 
     completed = json.loads((output_dir / "launch-complete.json").read_text(encoding="utf-8"))
@@ -133,6 +197,12 @@ def verify(test: OverrideDefinitions, *, output_dir: Path) -> None:
 
 
 def run_single(test: OverrideDefinitions, *, output_dir: Path | None = None) -> None:
+    if test.ci_kind == "npu_smoke":
+        run_dispatch_smoke(test)
+        return
+    if test.ci_kind != "train":
+        raise ValueError(f"unknown CI case kind: {test.ci_kind}")
+
     from tests.integration_tests.run_tests import _resolve_npu_pool_ids, run_tests
 
     if output_dir is None:
@@ -152,6 +222,16 @@ def run_single(test: OverrideDefinitions, *, output_dir: Path | None = None) -> 
 
 
 def run_distributed(test: OverrideDefinitions, *, phase: str, output_dir: Path) -> None:
+    if test.ci_kind == "npu_smoke":
+        if phase == "verify":
+            return
+        elif phase == "launch":
+            run_dispatch_smoke(test)
+        else:
+            raise ValueError("phase must be launch or verify")
+        return
+    if test.ci_kind != "train":
+        raise ValueError(f"unknown CI case kind: {test.ci_kind}")
     if phase == "verify":
         verify(test, output_dir=output_dir)
         return
@@ -164,7 +244,7 @@ def run_distributed(test: OverrideDefinitions, *, phase: str, output_dir: Path) 
         if os.environ.get(key, str(expected)) != str(expected):
             raise ValueError(f"{key} must be {expected}")
     test, run_root = prepare_launch(test, output_dir)
-    from tests.integration_tests.run_tests import _run_cmd, DETERMINISTIC_ARGS
+    from tests.integration_tests.run_tests import DETERMINISTIC_ARGS, _run_cmd
 
     env = {key: value for key, value in os.environ.items() if key not in test.unset_env}
     env.update({**(test.env_vars or {}), "NNODES": str(test.nnodes)})

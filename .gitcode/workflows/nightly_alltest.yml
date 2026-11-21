@@ -1,0 +1,16 @@
+name: lite-ci-nightly-alltest
+# TODO: replace the Smoke profile with the nightly suite and configure its schedule.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Smoke profile to run'
+        type: choice
+        options: ['dispatch_smoke']
+        default: 'dispatch_smoke'
+        required: false
+jobs:
+  nightly:
+    uses: ./.gitcode/workflows/dispatcher_smoke.yml
+    with:
+      profile: ${{ inputs.profile || 'dispatch_smoke' }}

@@ -299,6 +299,14 @@ gh workflow run training.yml -R torchtitan-npu/torchtitan-npu --ref master \
 gh workflow run dispatcher_smoke.yml -R torchtitan-npu/torchtitan-npu --ref master
 ```
 
+#### GitCode 原生 Smoke
+
+GitCode 的三个入口都以 `lite-ci-` 开头：`lite-ci-dispatcher-smoke`、`lite-ci-nightly-alltest`、`lite-ci-per-pr-alltest`；Lite Actions Worker 按这个前缀识别 GitCode 入口。GitCode 要求可复用工作流位于 `.gitcode/workflows/` 或 `.atomgit/workflows/`；等待与结果汇总由 `tools/lite_actions/entrypoint.py` 的 `wait-gitcode` 入口执行。用例定义位于 `training_cases/dispatch_smoke.py`；当前 `dispatch_smoke` 包含 Blue OS 探针以及 8P、16P、8P HCCL 通信用例，Yellow OS 探针暂未启用。
+
+三个入口都只支持手动触发，表单里只有一个 `profile` 选择框，当前可选值为 `dispatch_smoke`；`lite-ci-dispatcher-smoke` 另外提供 `workflow_call`，供 `lite-ci-nightly-alltest` 和 `lite-ci-per-pr-alltest` 复用。手动表单的选择只影响等待端校验的用例集；实际执行集合仍由被测提交上的 `SMOKE_PROFILES` 决定，因此新增 profile 必须同时修改该文件。
+
+Lite Actions Worker 需要启用对应的 GitCode 仓库与工作流。结果回写账号默认为 `depeng1994`，可通过仓库变量 `LITE_CI_RESULT_ACTOR` 覆盖，且须与 Worker 所用账号一致。PR 运行使用关联 PR 的 Head 提交，包括 Fork 来源。GitCode Actions 页面显示每个用例的结果；缺少结果、执行失败或清理失败时，工作流不会报告成功。
+
 ### 3.3 CI 矩阵并发与动态端口分配
 
 请求内每个 case 携带 `device`（`a3` / `a5`）、`nnodes`、`ngpu`、`required_env` 与 `phases`，
@@ -307,6 +315,8 @@ gh workflow run dispatcher_smoke.yml -R torchtitan-npu/torchtitan-npu --ref mast
 在 GitHub Actions CI 流水线中，每个 Matrix Case 是独立的调度与执行单元：
 * **并发调度**：Lite Actions 调度机会根据物理集群的空闲 NPU 资源池，将互不冲突的 Case 并发拉起执行（如单机 8P 各用例并发执行，或双机 16P 跨节点独立分配）。
 * **动态端口防冲突**：当同机或跨机并发拉起多个任务时，调度机会为每个任务动态分配互不冲突的通信端口（通过注入环境变量 `LITE_CI_MASTER_PORT`、`LITE_CI_HCCL_IF_BASE_PORT`、`LITE_CI_HCCL_HOST_PORT_RANGE` 与 `LITE_CI_HCCL_NPU_PORT_RANGE`）。仓内的 `tools/lite_actions/runner.py` 会自动读取并映射这些变量，覆盖用例的默认端口。开发者编写用例时无需硬编码特殊端口，使用默认值即可。
+
+Smoke 用例直接使用调度机分配的 `MASTER_PORT`、`HCCL_IF_BASE_PORT`、`HCCL_HOST_SOCKET_PORT_RANGE` 和 `HCCL_NPU_SOCKET_PORT_RANGE`；训练用例继续使用上述 `LITE_CI_` 变量映射。
 
 ### 3.4 硬件环境与调度故障排障
 若任务长时间卡在排队状态、远端 NPU 报告 Quarantine 或出现 SSH 连接异常，属于物理集群调度机层面的环境状态问题，请参阅 Lite Actions 调度系统运维说明或联系集群管理员排查。

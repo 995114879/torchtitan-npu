@@ -71,10 +71,17 @@ def test_manual_suite_choices_resolve_to_registered_cases():
             assert entrypoint.select(catalogue, suite=name)
 
 
-def test_every_catalog_case_is_reachable_from_nightly():
-    """No orphan cases: everything defined by a layer is registered in the suite tree."""
+def test_every_catalog_case_is_reachable_from_a_registered_suite():
+    """No orphan cases: every case belongs to the nightly tree or a Smoke profile.
+
+    Training cases live in the ``.github/ci/suites.json`` layer tree; Smoke cases
+    are registered in ``SMOKE_PROFILES`` instead, so both layers count as owners.
+    """
     catalogue = entrypoint.catalog()
-    assert set(catalogue) == set(case_ids("nightly"))
+    registered = set(case_ids("nightly"))
+    for profile in entrypoint.SMOKE_PROFILES.values():
+        registered.update(profile)
+    assert set(catalogue) == registered
 
 
 def test_every_case_points_at_an_existing_launcher():
