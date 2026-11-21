@@ -980,3 +980,87 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
     assert inputs.cu_seqlens_q is row.q.cu_seqlens
     assert inputs.cu_seqlens_k is row.cmp_k.cu_seqlens
     assert inputs.cmp_residual_k is row.cmp_k.residual
+
+
+def test_apply_quantization_converter_groups_converter_logs_across_layers(converter_module, caplog):
+    from torchtitan.models.common.moe import RoutedExperts
+
+    from torchtitan_npu.config.configs import KVNormQuantizationConfig, QuantizationExtensionConfig
+    from torchtitan_npu.models.deepseek_v4 import model_registry
+
+    spec = model_registry("debugmodel", moe_comm_backend="standard", num_mtp_layers=0)
+    num_layers = len(spec.model.layers)
+    num_routed = len(list(spec.model.traverse(RoutedExperts.Config)))
+    assert num_layers == 4 and num_routed > 1
+
+    with caplog.at_level(logging.DEBUG):
+        converter_module.apply_quantization_converter(
+            spec,
+            QuantizationExtensionConfig(
+                enable_quantized_training=True,
+                recipe="all_mxfp8",
+                all_to_all_quant_format="mxfp8",
+                kv_norm_quantization=KVNormQuantizationConfig(
+                    format="mxfp8",
+                    block_size=64,
+                    fqns=[".attention.kv_norm", ".attention.compressor.norm"],
+                ),
+            ),
+            model_compile_enabled=False,
+        )
+
+    info_converter = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and record.getMessage().startswith("[Converter] ")
+    ]
+    debug_converter = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.DEBUG and record.getMessage().startswith("[Converter] ")
+    ]
+
+    assert info_converter
+    assert all(" matched=" in msg and " fqns=[" in msg for msg in info_converter)
+    assert len(info_converter) < len(debug_converter)
+    assert any(
+        "NpuQuantizeConverter:" in msg and "model_spec.model.layers.{0..3}.attention.wq_a" in msg
+        for msg in info_converter
+    )
+    assert any(
+        "KVNormFakeQuantConverter:" in msg
+        and "model_spec.model.layers.{0..3}.attention.kv_norm" in msg
+        and "model_spec.model.layers.{2,3}.attention.compressor.norm" in msg
+        for msg in info_converter
+    )
+    assert any("NpuAllToAllQuantizeConverter:" in msg and f"matched={num_routed}" in msg for msg in info_converter)
+    assert any("model_spec.model.layers.0.attention.wq_a " in msg for msg in debug_converter)
+
+
+def test_selective_ac_save_op_hooks_deduplicate_repeated_logs(converter_module, monkeypatch, caplog):
+    from torchtitan.distributed import activation_checkpoint as ac
+
+    from torchtitan_npu.extensions.adaptor.torchao import param_swaps
+
+    monkeypatch.setattr(ac, "_get_default_save_ops", lambda: set())
+    monkeypatch.setattr(converter_module, "_AC_BLOCK_OPS_PATCHED", [False])
+    monkeypatch.setattr(param_swaps, "_AC_QUANT_CODES_PATCHED", [False])
+
+    resolved_ops: dict[str, object] = {"cann_ops_transformer.sparse_flash_mla.default": object()}
+    monkeypatch.setattr(param_swaps, "_resolve_torch_op", lambda path: resolved_ops.get(path))
+
+    converter_module._save_block_ops_under_selective_ac(1)
+    param_swaps._save_quant_codes_under_selective_ac(True)
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(4):
+            ac._get_default_save_ops()
+        resolved_ops["cann_ops_transformer.lightning_indexer.default"] = object()
+        ac._get_default_save_ops()
+
+    block_logs = [r.getMessage() for r in caplog.records if r.getMessage().startswith("save_block_ops_level=1:")]
+    hif8_logs = [r.getMessage() for r in caplog.records if r.getMessage().startswith("enable_hif8_save_quant_codes:")]
+    assert len(block_logs) == 2
+    assert "not registered: cann_ops_transformer.lightning_indexer.default" in block_logs[0]
+    assert "not registered:" not in block_logs[1]
+    assert len(hif8_logs) == 1

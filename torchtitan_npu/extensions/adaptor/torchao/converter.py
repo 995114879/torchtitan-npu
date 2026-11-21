@@ -21,7 +21,6 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
-import torch
 from torchao_npu.quantization.quant_configs import (  # noqa: F401  (re-exported)
     BlockMXQuantizeConfig,
     FP8QuantizeConfig,
@@ -64,7 +63,7 @@ from .filters import (  # noqa: F401
     any_config_filter,
     match_config_fqn_suffix,
 )
-from .param_swaps import block_fp8_param_swap, mxfp8_param_swap
+from .param_swaps import _patch_selective_ac_save_ops, block_fp8_param_swap, mxfp8_param_swap
 from .recipes import (
     NpuAllToAllQuantizeConverter,
     NpuQuantizeConverter,
@@ -100,17 +99,6 @@ _BLOCK_SAVE_OPS = (
 )
 
 
-def _resolve_torch_op(path: str):
-    """``torch.ops`` lookup by dotted path, or None if not registered yet."""
-    obj = torch.ops
-    try:
-        for part in path.split("."):
-            obj = getattr(obj, part)
-    except (AttributeError, RuntimeError):
-        return None
-    return obj
-
-
 def _save_block_ops_under_selective_ac(level: int) -> None:
     """extension.quantization.save-block-ops-level: keep the attention / mHC /
     MoE-routing results across the selective-AC boundary instead of
@@ -129,40 +117,10 @@ def _save_block_ops_under_selective_ac(level: int) -> None:
     at patch time) because some ops register only once model modules have
     imported ``cann_ops_transformer``.
     """
-    if level <= 0 or _AC_BLOCK_OPS_PATCHED[0]:
-        return
-    try:
-        from torchtitan.distributed import activation_checkpoint as ac
-    except ImportError:
+    if level <= 0:
         return
     wanted = tuple(path for lvl, path in _BLOCK_SAVE_OPS if lvl <= level)
-    if not wanted:
-        return
-    _AC_BLOCK_OPS_PATCHED[0] = True
-    orig = ac._get_default_save_ops
-
-    def _get_default_save_ops():
-        ops = orig()
-        added, missing = [], []
-        for path in wanted:
-            op = _resolve_torch_op(path)
-            if op is None:
-                # Not registered in this build/config (e.g. the lightning
-                # indexer is off for this model). A miss is a lost
-                # optimization, never a correctness problem.
-                missing.append(path)
-            else:
-                ops.add(op)
-                added.append(path)
-        logger.info(
-            "save_block_ops_level=%d: added %s to the selective-AC save list%s",
-            level,
-            ", ".join(added) or "nothing",
-            f" (not registered: {', '.join(missing)})" if missing else "",
-        )
-        return ops
-
-    ac._get_default_save_ops = _get_default_save_ops
+    _patch_selective_ac_save_ops(_AC_BLOCK_OPS_PATCHED, wanted, f"save_block_ops_level={level}")
 
 
 def _check_prequantize_policy(

@@ -34,6 +34,7 @@ from torchtitan.tools.logging import logger
 from ..configs import ModelType
 from ..configs.deepseek_v4 import V4FilterKeys
 from ..filters import _replace_config, match_config_fqn_suffix
+from ..logging_utils import GroupedConverterLogger
 from . import QuantComponent, component
 
 if TYPE_CHECKING:
@@ -343,6 +344,7 @@ class KVNormFakeQuantConverter(QuantizationConverter):
         ]
 
         converted = 0
+        replacement_logger = GroupedConverterLogger(self)
         for fqn, config, parent, attr in matches:
             if parent is None:
                 raise ValueError(f"the norm fake quantization does not support the root config ({fqn!r})")
@@ -374,17 +376,14 @@ class KVNormFakeQuantConverter(QuantizationConverter):
             )
             model_config = _replace_config(model_config, parent, attr, replacement)
             converted += 1
-            logger.info(
-                "[Converter] %s.%s: model_spec.model.%s %s -> %s",
-                type(self).__module__,
-                type(self).__qualname__,
-                fqn,
-                type(config).__qualname__,
-                type(replacement).__qualname__,
+            replacement_logger.record(
+                f"{type(config).__qualname__} -> {type(replacement).__qualname__}",
+                f"model_spec.model.{fqn}",
             )
 
         if converted == 0 and self.config.require_match:
             raise ValueError("KVNormFakeQuantConverter did not match any config nodes")
+        replacement_logger.flush()
         logger.info("Converted %d config node(s) for KV norm fake quantization", converted)
         return model_config
 

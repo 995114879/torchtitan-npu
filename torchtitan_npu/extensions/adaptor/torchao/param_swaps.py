@@ -31,6 +31,58 @@ _QUANT_CODE_SAVE_OPS = (
 _AC_QUANT_CODES_PATCHED = [False]
 
 
+def _resolve_torch_op(path: str):
+    """``torch.ops`` lookup by dotted path, or None if not registered yet."""
+    obj = torch.ops
+    try:
+        for part in path.split("."):
+            obj = getattr(obj, part)
+    except (AttributeError, RuntimeError):
+        return None
+    return obj
+
+
+def _patch_selective_ac_save_ops(
+    patched_flag: list[bool],
+    op_paths: tuple[str, ...],
+    log_prefix: str,
+) -> None:
+    """Wrap ``ac._get_default_save_ops`` once to include extra ops and deduplicate logs."""
+    if not op_paths or patched_flag[0]:
+        return
+    try:
+        from torchtitan.distributed import activation_checkpoint as ac
+    except ImportError:
+        return
+    patched_flag[0] = True
+    orig = ac._get_default_save_ops
+    last_logged: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+
+    def _get_default_save_ops():
+        nonlocal last_logged
+        ops = orig()
+        added, missing = [], []
+        for path in op_paths:
+            op = _resolve_torch_op(path)
+            if op is None:
+                missing.append(path)
+            else:
+                ops.add(op)
+                added.append(path)
+        summary = (tuple(added), tuple(missing))
+        if summary != last_logged:
+            last_logged = summary
+            logger.info(
+                "%s: added %s to the selective-AC save list%s",
+                log_prefix,
+                ", ".join(added) or "nothing",
+                f" (not registered: {', '.join(missing)})" if missing else "",
+            )
+        return ops
+
+    ac._get_default_save_ops = _get_default_save_ops
+
+
 def _save_quant_codes_under_selective_ac(enable: bool) -> None:
     """extension.quantization.enable-hif8-save-quant-codes: keep the quantized
     matmul's operands and result across the selective-AC boundary instead of
@@ -40,36 +92,9 @@ def _save_quant_codes_under_selective_ac(enable: bool) -> None:
     blocks: torchtitan reads ``_get_default_save_ops`` when it installs
     activation checkpointing.
     """
-    if not enable or _AC_QUANT_CODES_PATCHED[0]:
+    if not enable:
         return
-    try:
-        from torchtitan.distributed import activation_checkpoint as ac
-    except ImportError:
-        return
-    _AC_QUANT_CODES_PATCHED[0] = True
-    orig = ac._get_default_save_ops
-
-    def _get_default_save_ops():
-        ops = orig()
-        added, missing = [], []
-        for path in _QUANT_CODE_SAVE_OPS:
-            obj = torch.ops
-            try:
-                for part in path.split("."):
-                    obj = getattr(obj, part)
-            except (AttributeError, RuntimeError):
-                missing.append(path)
-                continue
-            ops.add(obj)
-            added.append(path)
-        logger.info(
-            "enable_hif8_save_quant_codes: added %s to the selective-AC save list%s",
-            ", ".join(added) or "nothing",
-            f" (not registered: {', '.join(missing)})" if missing else "",
-        )
-        return ops
-
-    ac._get_default_save_ops = _get_default_save_ops
+    _patch_selective_ac_save_ops(_AC_QUANT_CODES_PATCHED, _QUANT_CODE_SAVE_OPS, "enable_hif8_save_quant_codes")
 
 
 def mxfp8_param_swap() -> ParamSwapConfig:
