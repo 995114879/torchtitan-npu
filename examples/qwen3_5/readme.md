@@ -11,15 +11,15 @@
 ## Qwen3.5 multimodal dependencies
 
 The Qwen3.5 adapter reuses TorchTitan's upstream image and video preprocessing.
-Install the torchvision nightly that declares compatibility with the container's
-Torch build, then install this repository without resolving the container's
+Install the stable CPU torchvision wheel that matches torch 2.14.0 (the baseline in
+`requirements.txt`), then install this repository without resolving the container's
 custom Torch/torch_npu pair:
 
 ```bash
 python -m pip install av einops pillow
 python -m pip install --no-deps \
-  --index-url https://download.pytorch.org/whl/nightly/cpu \
-  torchvision==0.29.0.dev20260814+cpu
+  --index-url https://download.pytorch.org/whl/cpu \
+  torchvision==0.29.0+cpu
 python -m pip install --no-deps -e ../torchtitan
 python -m pip install --no-deps -e .
 ```
