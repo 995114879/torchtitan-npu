@@ -31,6 +31,11 @@ tests/unit_tests/tooling/training_log_visualization/test_training_log_visualizat
 
 `torchtitan_npu/patches/torch_npu/` 中的文件不是「上游 torchtitan 临时 patch」：它们改变 PyTorch、Inductor 或 `torch_npu` 的 NPU 运行时行为，例如 `determinism.py` 替换 `torch.use_deterministic_algorithms`，`device_copy.py` 修改 Inductor 的 `DeviceCopy` 和 `prims.device_put`。对应测试镜像到 `tests/unit_tests/patches/torch_npu/`；强制 eager 的 TorchTitan 兼容行为则归 `extensions/torchtitan/`。
 
+## 进程与全局状态隔离
+创建默认 process group 的 fixture 必须在自身作用域内成对清理；将 `yield` 放在 `try/finally` 中，在 `finally` 释放自己创建的 process group，确保测试断言失败时也能完成 teardown。不得让后续测试依赖前一测试留下的默认进程组，也不得用全套结束时的统一清理掩盖泄漏。
+
+CPU 多进程测试涉及 autograd 时使用局部 `spawn` context，避免 `fork` 继承父进程已启动的 autograd 线程状态。worker 必须是可导入模块中的顶层函数；子进程自行准备所需的 CPU 替身、临时环境及 process group，并在退出前清理，不能依赖父进程中的 monkeypatch、导入缓存或全局初始化。单独运行通过后，还应按会触发状态污染的执行顺序组合回归，并报告组合运行与完整套件的实际结果。
+
 ## 执行归属
 
 只要测试放在 `tests/unit_tests/`，现有 `.ci/unit_test.sh` 的 `pytest tests/unit_tests` 就能发现它；报告仍须单独标注 `tooling`，避免把 tooling 通过数写成产品覆盖。后续若保留其他目录外的测试，必须在对应 CI suite 显式列出执行路径，不能依赖开发者手工运行。

@@ -132,9 +132,10 @@ def _recovery_validation_worker(rank, store, corrupt):
 
 @pytest.mark.parametrize("corrupt", [False, True], ids=["matching-plans", "corrupt-plan"])
 def test_rank_local_healing_validates_muon_on_all_replica_ranks(tmp_path, corrupt):
+    # Workers must not inherit the parent's process group or autograd threads.
     torch.multiprocessing.start_processes(
         _recovery_validation_worker,
         args=((tmp_path / "store").as_uri(), corrupt),
         nprocs=2,
-        start_method="fork",
+        start_method="spawn",
     )

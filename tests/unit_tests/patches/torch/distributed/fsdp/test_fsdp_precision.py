@@ -293,15 +293,17 @@ def _unsharded(param):
 
 
 @pytest.fixture(scope="module")
-def _mesh():
+def _mesh(tmp_path_factory):
     """A single-rank CPU gloo mesh for real ``fully_shard`` calls."""
-    if not dist.is_initialized():
-        import tempfile
-
-        store = f"file://{tempfile.mkdtemp()}/store"
+    owns_process_group = not dist.is_initialized()
+    if owns_process_group:
+        store = (tmp_path_factory.mktemp("fsdp-precision") / "store").as_uri()
         dist.init_process_group("gloo", init_method=store, rank=0, world_size=1)
-    yield init_device_mesh("cpu", (1,))
-    dist.destroy_process_group()
+    try:
+        yield init_device_mesh("cpu", (1,))
+    finally:
+        if owns_process_group:
+            dist.destroy_process_group()
 
 
 class TestUnshardPrecision:

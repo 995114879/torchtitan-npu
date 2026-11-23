@@ -255,8 +255,23 @@ def test_adamw_restore_continues_on_compute_device() -> None:
     assert state["exp_avg_sq"].device.type == "npu"
 
 
+@pytest.fixture
+def _muon_cpu_mesh(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    owns_process_group = not dist.is_initialized()
+    if owns_process_group:
+        dist.init_process_group("gloo", init_method=(tmp_path / "muon-store").as_uri(), rank=0, world_size=1)
+    try:
+        yield init_device_mesh("cpu", (1,), mesh_dim_names=("dp_shard",))
+    finally:
+        if owns_process_group:
+            dist.destroy_process_group()
+
+
 @requires_npu
-def test_muon_checkpoint_roundtrip_steps_on_compute_device() -> None:
+def test_muon_checkpoint_roundtrip_steps_on_compute_device(_muon_cpu_mesh) -> None:
     """Save -> fresh optimizer -> real load_state_dict -> step again.
 
     Exercises the production restore chain: PyTorch's load cast sends the
@@ -265,24 +280,12 @@ def test_muon_checkpoint_roundtrip_steps_on_compute_device() -> None:
     ``step()`` re-validates the momentum storage layout before the bucket
     pipeline runs.
     """
-    import os
-    import socket
-
-    import torch.distributed as dist
-    from torch.distributed.device_mesh import init_device_mesh
     from torch.distributed.tensor import Replicate, distribute_tensor
     from torchtitan.distributed.flex_shard.optimizer_reshard import BucketConfig, ComputeLayout, Owned
 
     from torchtitan_npu.extensions.cpu_offload.cpu_offload_muon import build_cpu_offload_distributed_muon
 
-    if not dist.is_initialized():
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group(backend="gloo", rank=0, world_size=1)
-    mesh = init_device_mesh("cpu", mesh_shape=(1,), mesh_dim_names=("dp_shard",))
+    mesh = _muon_cpu_mesh
     device = torch.device("npu", torch_npu.npu.current_device())
 
     def make_parameter():
