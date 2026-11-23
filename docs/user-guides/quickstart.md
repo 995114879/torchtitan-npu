@@ -73,13 +73,35 @@ bash scripts/run_train.sh \
 
 ### 单机 8 卡 EP8 训练任务
 
-直接复用 DeepSeek-V4 单机 8 卡示例脚本。该脚本默认使用 8 卡、EP8/DP8 并行配置和 `deepseek_v4_flash_43layers_16experts` 模型配置。运行前需准备与 DeepSeek-V4 配套的 Tokenizer，并将下面的 `HF_ASSETS_PATH` 替换为其实际目录：
+直接复用 DeepSeek-V4 单机 8 卡示例脚本。该脚本默认使用 8 卡、EP8/DP8 并行配置和 `deepseek_v4_flash_43layers_16experts` 模型配置，并读取仓库预置的 `tests/assets/c4_test` 数据集。
+
+运行前需准备与 DeepSeek-V4 配套的 Tokenizer。[DeepSeek-V4-Flash 官方发布版本](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/commit/a7aaed80dd2df27620eb534454253ea25eb11c7a) 提供了该入口所需的 `tokenizer.json` 和 `tokenizer_config.json`。先按 [Hugging Face CLI 安装说明](https://huggingface.co/docs/huggingface_hub/guides/cli#getting-started) 准备 `hf` 命令，再从仓库根目录执行以下命令，仅下载这两个文件，不下载模型权重：
 
 ```bash
-HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
+export HF_ASSETS_PATH="$PWD/downloads/DeepSeek-V4-Flash-tokenizer"
+hf download deepseek-ai/DeepSeek-V4-Flash \
+  tokenizer.json tokenizer_config.json \
+  --revision a7aaed80dd2df27620eb534454253ea25eb11c7a \
+  --local-dir "$HF_ASSETS_PATH"
+```
+
+`HF_ASSETS_PATH` 指向直接包含这两个文件的目录；使用已有下载时，将其设为实际目录。目录路径不要包含空格。保持该环境变量已导出，在同一 shell 中启动：
+
+```bash
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
   --training.steps 5
 ```
+
+如仅需检查启动流程，可从仓库根目录使用预置的测试 Tokenizer，无需下载：
+
+```bash
+HF_ASSETS_PATH=tests/assets/deepseek_v3 \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5
+```
+
+> [!WARNING]
+> 此替代命令仅用于 smoke 检查。`tests/assets/deepseek_v3` 是测试用 Tokenizer，其词表和文本编码不代表 DeepSeek-V4，不能用于正式训练。即使 8 张设备可见、进程退出码为 `0`，或 rank 0 输出 `aux_loss`，也不能据此证明 V4 资产兼容、训练有效、模型质量或 checkpoint 有效性。
 
 DeepSeek-V4 的 SMLA 融合路径和 TND 数据约定见 [DeepSeek-V4 TND 适配](../feature_guides/deepseek_v4_tnd.md)。
 
