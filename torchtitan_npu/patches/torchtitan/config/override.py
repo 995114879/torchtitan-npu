@@ -5,11 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 # Upstream-PR: https://github.com/pytorch/torchtitan/pull/6180
+# Upstream-PR: https://github.com/pytorch/torchtitan/pull/6315
 
-"""Backport grouped override success logs to TorchTitan v0.3.0.
+"""Backport grouped override success logs with folded FQN ranges to TorchTitan v0.3.0.
 
 The configuration observability extension owns the runtime bindings.
-Remove this module after the TorchTitan dependency includes the PR.
+Remove this module after the TorchTitan dependency includes the PRs.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from torchtitan.tools.logging import logger
+
+from torchtitan_npu.patches.torchtitan.config.format import fold_indexed_paths
 
 if TYPE_CHECKING:
     from torchtitan.config.configurable import Configurable
@@ -67,7 +70,7 @@ def apply_overrides(
                 factory,
                 transition,
                 len(fqns),
-                fqns,
+                fold_indexed_paths(fqns),
             )
         logger.info(f"Applied {len(replacements)} override(s)")
     elif override_config.imports:

@@ -12,7 +12,9 @@
 - https://github.com/pytorch/torchtitan/pull/4708
 - https://github.com/pytorch/torchtitan/pull/4763
 - https://github.com/pytorch/torchtitan/pull/4934
+- https://github.com/pytorch/torchtitan/pull/6180
 - https://github.com/pytorch/torchtitan/pull/6290
+- https://github.com/pytorch/torchtitan/pull/6315
 - https://github.com/pytorch/pytorch/pull/201621
 -->
 
@@ -29,7 +31,7 @@
   # Pending upstream PR: https://github.com/pytorch/pytorch/pull/NNNN
   ```
 
-- 模块 docstring 需说明补丁内容，并以 "Remove this module after the TorchTitan dependency includes the PR." 结尾。
+- 模块 docstring 需说明补丁内容，并以 "Remove this module after the TorchTitan dependency includes the PR."（涉及多个 PR 时可用 "PRs."）结尾。
 - 对原模块/类做属性替换的 monkey patch 必须封装在 `def apply() -> None:` 中并在文件末尾调用（`apply()`），补丁逻辑内使用完整模块路径（`import torchtitan.models.common.moe` 后以 `torchtitan.models.common.moe.X = ...` 赋值），不使用短导入别名。纯定义被模型目录引用的 backport 类（如 `BatchedLinear`、`BaseMaskHandler`、`SingleComplexRoPE`、`AuxLoss`、`VarlenCPMetadata`）不需要 `apply()`。
 
 校验（除 `__init__.py` 等包胶水文件外，每个补丁文件都应命中）：
@@ -67,12 +69,13 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | [#201621](https://github.com/pytorch/pytorch/pull/201621) | 为本地 FileSystemReader 增加可选 mmap 加载，对应 `distributed/checkpoint/filesystem` |
 | [#6180](https://github.com/pytorch/torchtitan/pull/6180) | 回移 override 成功日志分组，对应 `config/override.py` |
 | [#6290](https://github.com/pytorch/torchtitan/pull/6290) | 将 `debug.print_config` 配置打印压缩为无损扁平折叠 JSON，对应 `config/format.py` 和 `trainer.py` |
+| [#6315](https://github.com/pytorch/torchtitan/pull/6315) | 对分组 override 日志中的索引 FQN 做 `{start..end}` 无损范围折叠，对应 `config/format.py` 和 `config/override.py` |
 
 上述 7 个 TorchTitan PR（#4534、#4575、#4578、#4598、#4663、#4664、#4934）已在上游合入，但 `v0.3.0` 尚未包含这些修复。
 
 四个 EP overlap 补丁的作用、启用方式与排查手段见
 [`docs/feature_guides/graph_trainer_ep_overlap.md`](../../../docs/feature_guides/graph_trainer_ep_overlap.md)。
 
-Override 日志分组由 `config/override.py` 回移到 TorchTitan v0.3.0。升级到包含该实现的上游版本后，删除补丁并让配置观察扩展直接委托上游 `apply_overrides`。
+Override 日志分组与索引 FQN 范围折叠由 `config/override.py` 和 `config/format.py` 回移到 TorchTitan v0.3.0（对应 `#6180`、`#6315`）。升级到包含该实现的上游版本后，删除补丁并让配置观察扩展直接委托上游 `apply_overrides`。
 
 对应 PR 合入且 TorchTitan 依赖更新后，应删除相关补丁及导入；全部补丁清理完成后，删除本目录。

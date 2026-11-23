@@ -51,7 +51,7 @@ override：
 
 所有匹配都基于修改前的配置树收集。replacement 不会被再次遍历，因此条目顺序不会改变
 匹配结果。包加载的配置观察扩展会将工厂名、替换前后配置类名及入口 `kwargs` 相同的逐节点
-`[Override]` 成功日志合并为一条（列出 `matched` 命中数与全部节点 `fqns`），并保留
+`[Override]` 成功日志合并为一条（列出 `matched` 命中数与 `fqns`，其中连续/离散数字索引段会无损折叠为 `{start..end}` / `{a,b}`，按具体层号检索日志时需留意折叠区间），并保留
 `Applied N override(s)` 汇总。`[Override zero match]` 提供类型、FQN 筛选条件及候选配置；
 `[Override configured]` 按节点最终实现与几何参数汇总（仅表示构建前选定实现，不证明设备
 kernel 已执行）；`[Override quantization]` 记录量化配置；`[Override resolution failed]`
