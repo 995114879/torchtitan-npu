@@ -22,6 +22,11 @@ else
     export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal_deepep}"
 fi
 
+# Keep optimizer state resident on the NPU by default: the A3 launcher would
+# otherwise append swap_optimizer. The `-` (not `:-`) expansion keeps an
+# explicit OPTIMIZER_OVERRIDES from the caller, so swap can still be enabled.
+export OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-}"
+
 # Use the command line `npu-smi info -t topo` to query the CPU affinity of the
 # NPU cards for configuration.
 export CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1,npu0:288-311,npu1:312-335,npu2:336-359,npu3:360-383,npu4:96-119,npu5:120-143,npu6:144-167,npu7:168-191}"

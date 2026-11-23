@@ -39,7 +39,7 @@ SPMD_BACKEND="spmd_types"
 # Retain the validated eager / Muon / FullAC resource crop.
 SEQ_LEN=4096
 MBS=1
-GBS=8
+GBS="${GBS:-64}"
 STEPS=40
 
 # Debug

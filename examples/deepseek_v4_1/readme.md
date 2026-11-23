@@ -40,11 +40,11 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --training.steps 3 --lr-scheduler.total-steps 3 --lr-scheduler.warmup-steps 2
 ```
 
-单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家（`CONFIG` 取该多模态配方的 `*_deepep` 变体）；均使用 seq4096（4k）、local/global batch 1/8、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
+单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家（`CONFIG` 取该多模态配方的 `*_deepep` 变体）；均使用 seq4096（4k）、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。两个 8P debug 入口共用 A3 脚本的默认 local/global batch 1/64（`GBS=64`，可用环境变量或末尾 CLI 覆盖）；qat/sft 派生入口同样继承该默认值，需要保持 1/8 时显式设置 `GBS=8`。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
 
-关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机使用 `--training.seq-len 2048`，脚本保留 4k 默认配置。A5 多机保留与单机一致的 swap override；可通过 `OPTIMIZER_OVERRIDES` 显式覆盖。
+关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机使用 `--training.seq-len 2048`，脚本保留 4k 默认配置。A3 与 A5 8P 入口的默认 swap 行为不同：A5 包装层把未设置的 `OPTIMIZER_OVERRIDES` 归一为空，默认不启用 swap override（优化器状态常驻 NPU）；调用方显式设置该变量时仍会生效，也可在末尾用 `--override.imports` 传入包含 `swap_optimizer` 的完整列表重新启用。A3 8P 入口与 A5 多机入口仍默认保留 swap override。
 
-A5 的 `CPU_AFFINITY_CONF` 应按主机拓扑覆盖。通过 `CLI_OVERRIDES` 扩展融合列表：A3 基础列表之外，文本 RoPE 经该通道按硬件选择（A3 默认 `asc_complex`，A5 换为 `asc_partial`），MoE dispatcher 也走这个通道（A3 默认 `token_dispatcher.asc`，A5 替换为 `token_dispatcher.asc_deepep`），A5 默认追加 SwiGLUGroup、sparse attention、融合 LI 选分与 Sinkhorn，不重复传入 `--override.imports`。与 override 配套，A5 入口默认把 `CONFIG` 设为对应的 `*_deepep` 配方（模型侧 `moe_comm_backend="deepep"`）。显式传 `--override.imports` 会替换整个集合，需自行包含所需的 RoPE、MoE token dispatcher（DeepEP 用 `asc_deepep`）与 swap optimizer。最终选择随 Trainer Config 打印。
+A5 的 `CPU_AFFINITY_CONF` 应按主机拓扑覆盖。通过 `CLI_OVERRIDES` 扩展融合列表：A3 基础列表之外，文本 RoPE 经该通道按硬件选择（A3 默认 `asc_complex`，A5 换为 `asc_partial`），MoE dispatcher 也走这个通道（A3 默认 `token_dispatcher.asc`，A5 替换为 `token_dispatcher.asc_deepep`），A5 默认追加 SwiGLUGroup、sparse attention、融合 LI 选分与 Sinkhorn，不重复传入 `--override.imports`。与 override 配套，A5 入口默认把 `CONFIG` 设为对应的 `*_deepep` 配方（模型侧 `moe_comm_backend="deepep"`）。显式传 `--override.imports` 会替换整个集合，需自行包含所需的 RoPE、MoE token dispatcher（DeepEP 用 `asc_deepep`）；需要 swap 时再补上 swap_optimizer。最终选择随 Trainer Config 打印。
 
 普通运行不强制随机种子和确定性；精度对照须在双方命令中追加 `--debug.seed 42 --debug.deterministic`。默认关闭 checkpoint 且设置 `load_only=True`；保存时同时传 `--checkpoint.enable --checkpoint.no-load-only`。`load_only` 表示禁止保存，与 model-only 加载不同。tokenizer 统一经 `--hf-assets-path` 提供（测试可用仓内 `tests/assets/deepseek_v3` mini tokenizer），该参数本身不加载模型权重。
 
