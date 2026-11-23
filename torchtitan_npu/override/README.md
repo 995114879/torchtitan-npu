@@ -403,7 +403,7 @@ MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `t
 `tilelang_hc_post` 与 `asc_hc_post` 声明同一 `HcPost.Config` 节点，两者互斥，只能启用其一；二者均可与 `asc_hc_pre` 共存。
 `tilelang_hc_pre` 与 `asc_hc_pre`、`triton_hc_pre` 作用于同一 `HcPre.Config` 节点，只能选择一个；它可以与作用于 `HcPost.Config` 的 `asc_hc_post` 同时启用。
 
-依赖的 tilelang/tile_kernels 暂时未开源，不随默认 requirements 安装。
+依赖的 `tilelang` 运行时与 `tile_kernels` 算子包均已开源，但仍属可选依赖：默认 requirements 不包含它们，需按目标机的 CANN 版本自行安装匹配版本。
 推荐直接使用 `examples/deepseek_v4/*.sh` wrapper；单机调试可使用
 [deepseek_v4_mini_1p_cpt_2k_a3.sh](../../examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh)，
 它会组装 `--override.imports` 并调用 `scripts/run_train.sh`：
@@ -472,6 +472,15 @@ torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc
 torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc
 torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn
 ```
+
+`tilelang.tilelang_hc_pre` 与 `tilelang.tilelang_hc_post` 分别替换 `HcPre.Config` 与 `HcPost.Config`。
+同节点互斥关系：pre 侧 `tilelang_hc_pre` 与 `mhc.asc_sinkhorn` / `mhc.asc_hc_premix` 三者互斥；post 侧
+`tilelang_hc_post` 与 `mhc.asc_hc_post` 互斥。依赖外部 `tile_kernels`：V4.1 的这两个入口只用开源仓的 raw kernel
+（`tile_kernels.mhc.pre_split_mixes_kernel` / `pre_apply_mix_kernel` / `post_kernel`），安装开源 `TileKernels`
+即可满足；V4.0 的 `mhc.tilelang_hc_pre` 仍走旧布局 `tile_kernels.modeling.mhc.ops`，`mhc.tilelang_hc_head`
+只在 A5 分支依赖该布局（A3 用仓内 `head_compute_mix.py`，不需要 `tile_kernels`），因此只启用 V4.1 的入口时
+无需旧布局。安装方式见开源仓 <https://github.com/deepseek-ai/TileKernels>（包名 `tile_kernels`，
+`requires-python >= 3.12`，`tilelang>=0.1.15`）。
 
 `deepseek_v4_1/` 没有 `__init__.py`：导入该 package 不注册任何 V4.1 override，每个入口
 只在 `override.imports` 按完整 `module.function` 列名导入时注册。`mhc` 下的入口中，

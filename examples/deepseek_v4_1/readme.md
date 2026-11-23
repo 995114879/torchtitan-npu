@@ -46,6 +46,8 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
 
 A5 的 `CPU_AFFINITY_CONF` 应按主机拓扑覆盖。通过 `CLI_OVERRIDES` 扩展融合列表：A3 基础列表之外，文本 RoPE 经该通道按硬件选择（A3 默认 `asc_complex`，A5 换为 `asc_partial`），MoE dispatcher 也走这个通道（A3 默认 `token_dispatcher.asc`，A5 替换为 `token_dispatcher.asc_deepep`），A5 默认追加 SwiGLUGroup、sparse attention、融合 LI 选分与 Sinkhorn，不重复传入 `--override.imports`。与 override 配套，A5 入口默认把 `CONFIG` 设为对应的 `*_deepep` 配方（模型侧 `moe_comm_backend="deepep"`）。显式传 `--override.imports` 会替换整个集合，需自行包含所需的 RoPE、MoE token dispatcher（DeepEP 用 `asc_deepep`）；需要 swap 时再补上 swap_optimizer。最终选择随 Trainer Config 打印。
 
+mHC 的 pre/post 在两套实现之间切换：A5 的两个 4k CPT 入口用 `USE_TILELANG` 控制，`USE_TILELANG=1` 时把 `tilelang.tilelang_hc_pre` / `tilelang.tilelang_hc_post` 加入融合列表（走外部 `tile_kernels` 的 raw kernel），否则用 `mhc.asc_sinkhorn` + `mhc.asc_hc_post`（CANN）。
+
 普通运行不强制随机种子和确定性；精度对照须在双方命令中追加 `--debug.seed 42 --debug.deterministic`。默认关闭 checkpoint 且设置 `load_only=True`；保存时同时传 `--checkpoint.enable --checkpoint.no-load-only`。`load_only` 表示禁止保存，与 model-only 加载不同。tokenizer 统一经 `--hf-assets-path` 提供（测试可用仓内 `tests/assets/deepseek_v3` mini tokenizer），该参数本身不加载模型权重。
 
 indexer 的训练目标没有独立的损失项，它只走 A5 两个融合算子的反向夹具：`sparse_attn.asc` 的 SMLAG 反向按每个选中条目产出该层 attention 自身完整 softmax（窗口 + 压缩条目 + sink）的边际质量 `p`，写在 `topk_scores` 的梯度上；`lightning_indexer.asc` 的 SLIKG 反向把它当作教师，由 kernel 施加 `dI = Z·Y - p` 并产出 indexer 的 `q`/`k`/`w` 梯度。`topk_scores` 不参与任务损失，除这条边之外没有消费者，因此**A5 的两个 override 必须同开**：模型构造时按配置类标记检查这一对，只开一个直接报 `ValueError`，不会进入训练。单开 LI 时该梯度为 `None`、SLIKG 反向返回零梯度，indexer 全程不更新；单开 sparse attention 时 reference selector 会把 attention 级别的边际质量加到按 head 求和的 logits 上，训练信号是错的（该组合不做修复，仅由构造期检查拦住）。未使用的 top-k 槽位（`-1`）在教师上被置零。完整契约与 CPU 验证范围见 [override 说明](../../torchtitan_npu/override/README.md#deepseek-v41)。
@@ -181,7 +183,8 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
 | `common.token_dispatcher.asc_deepep`（A5） | 替换 `DeepEPTokenDispatcher`，由 CANN `ElasticBuffer` 完成 dispatch/combine；需配合 `CONFIG=*_deepep` | Ascend DeepEP dispatcher |
 | `mhc.asc_hc_post` | mHC post 变换 | Ascend mHC post |
 | `mhc.asc_sinkhorn`（仅 A5） | `HcPre._split_sinkhorn`（新接口，`hc_eps` 字段） | npu_mhc_sinkhorn |
-| `mhc.asc_hc_premix`（仅 A5） | `HcPre.forward`：Sinkhorn + 压流一并下沉。要求 `hc_mult=4`、`sinkhorn_iters=20`，950 上要求 `c ∈ {4096, 7168} |
+| `mhc.asc_hc_premix`（仅 A5） | `HcPre.forward`：Sinkhorn + 压流一并下沉。要求 `hc_mult=4`、`sinkhorn_iters=20`，950 上要求 `c ∈ {4096, 7168}` | `cann_ops_transformer.mhc_pre_sinkhorn_premix` |
+| `tilelang.tilelang_hc_pre` / `tilelang.tilelang_hc_post`（A5，`USE_TILELANG=1`） | 整体替换 `HcPre.forward` 与 `HcPost.forward` | 外部 `tile_kernels`（mhc4 + fp32 mix） |
 
 量化路径不是这两个 override 的包装，而是另一个 backend：开启 `--extension.quantization.enable-sparse-attention-quantization` 后，量化后的 sparse attention（`torchao_npu` 里 fused attention 的拷贝）由 converter 安装，它自己构建 entry 的四份 metadata（含量化 selector 的两条 schedule），因此 `sparse_attn.asc` 在该路径上不生效；`--extension.quantization.li-quantization mxfp4` 必须与该开关同时开启，否则非量化 attention 的 BF16 schedule 会被量化 kernel 读到（垃圾索引，kernel 可能崩），converter 会直接报错。非量化路径的 `lightning_indexer.fwd_sparse` / `.sparse_length` 当前留空，等带 candidate 的非量化算子落地后由 port 填。
 

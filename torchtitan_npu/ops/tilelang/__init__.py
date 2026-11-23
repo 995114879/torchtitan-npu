@@ -7,7 +7,8 @@
 
 The kernels are registered via ``torch.library.custom_op``. Their fake
 implementations keep ``torch.compile``/AOT eager graph capture independent of
-the optional TileLang runtime package.
+the optional TileLang runtime package.  The tilelang entries also need
+``tile_kernels`` (open source, not in ``requirements.txt``).
 """
 
 __all__ = [

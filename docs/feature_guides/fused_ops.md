@@ -212,7 +212,11 @@ python -m torchtitan_npu.train \
   config 自己构建；它必须与 selector 成对配置，单边启用会在模型构建前报 `ValueError`。CANN 路径用 `lightning_indexer.asc`，
   PyPTO 路径用 `lightning_indexer.pypto`。前者在 SMLAG 反向产出 teacher，后者消费它。
 - DeepSeek-V4 MHC 的 AscendC 入口声明 `HcPre.Config`/`HcPost.Config`，Triton 入口还包含
-  `HcHead.Config`；同一节点只能选择一个实现。
+  `HcHead.Config`；同一节点只能选择一个实现。DeepSeek-V4.1 另有
+  `tilelang.tilelang_hc_pre` / `tilelang.tilelang_hc_post`，分别声明 V4.1 自己的 `HcPre.Config` / `HcPost.Config`；
+  pre 侧与 `mhc.asc_sinkhorn` / `mhc.asc_hc_premix` 三者互斥，
+  post 侧与 `mhc.asc_hc_post` 互斥。Ascend 侧只支持 `hc_mult=4`，且仅 A5（Ascend 950）可用，
+  要求 `bfloat16` 输入与 `hidden % 64 == 0`；launcher 通过 `USE_TILELANG` 选择。
 - 两个 override 声明同一节点，或一个声明另一个的祖先/后代节点时会冲突；可移除互斥入口，
   或使用 `fqns` 缩小范围。
 

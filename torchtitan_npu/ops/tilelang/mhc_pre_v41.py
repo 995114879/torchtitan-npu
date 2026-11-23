@@ -9,18 +9,120 @@ DeepSeek-V4.1 keeps a cross-layer pre-mix graph: ``HcPre.forward(x, pre_mix)``
 collapses the branches with the *incoming* ``pre_mix`` (the previous
 sub-layer's freshly computed ``pre``) and returns its own new ``pre`` for the
 next sub-layer.  The V4.0 op collapses with the freshly computed ``pre``
-instead, so this module adds a V4.1 variant reusing the same TileKernels
-split/apply primitives and the native Sinkhorn runtime, with a backward that
-additionally propagates gradients to ``pre_mix``.
+instead, so this module adds a V4.1 variant with a backward that additionally
+propagates gradients to ``pre_mix``.
+
+The split/apply adapters live here as well (``_load_split_v41`` /
+``_load_apply_v41``): they call the kernel-level entry points
+``tile_kernels.mhc.pre_split_mixes_kernel`` / ``pre_apply_mix_kernel`` directly,
+so V4.0's ``mhc_pre.py`` keeps its own adapters untouched.
 """
 
+from functools import lru_cache
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 import torch_npu
 
-from .mhc_pre import _load_apply, _load_split, _split_backward
+from .mhc_pre import _split_backward
+
+# The mHC4 split kernel walks the token dimension in fixed 64-token blocks.
+_SPLIT_TOKEN_BLOCK = 64
+
+
+@lru_cache(maxsize=1)
+def _load_split_v41():
+    """V4.1-only adapter over the TileKernels split-mixes kernel.
+
+    The kernel consumes 2-D ``[tokens, (2 + hc_mult) * hc_mult]`` logits and writes
+    ``pre`` / ``post`` / ``comb`` into caller-owned buffers, so this closure
+    allocates them and restores the ``[B, S, ...]`` model shape.  Only the mHC4
+    Ascend path ships upstream, so other ``hc_mult`` values are rejected.
+    """
+
+    try:
+        from tile_kernels.mhc.pre_split_mixes_kernel import mhc_pre_split_mixes_fwd
+    except (ImportError, OSError) as error:
+        raise RuntimeError(
+            "TileLang V4.1 HcPre requires the installed tile_kernels package and a loaded CANN environment"
+        ) from error
+
+    def split(
+        input_mixes: torch.Tensor,
+        mhc_scale: torch.Tensor,
+        mhc_base: torch.Tensor,
+        mhc_mult: int,
+        mhc_post_mult_value: float,
+        mhc_pre_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if mhc_mult != 4:
+            raise RuntimeError(f"tile_kernels only ships the mhc_mult=4 split kernel, got mhc_mult={mhc_mult}")
+        batch_shape = tuple(input_mixes.shape[:-1])
+        total_mix = 2 * mhc_mult + mhc_mult * mhc_mult
+        tokens = input_mixes.numel() // total_mix
+        if tokens % _SPLIT_TOKEN_BLOCK:
+            raise RuntimeError(
+                f"tile_kernels mHC4 split kernel expects the token count to be a multiple of "
+                f"{_SPLIT_TOKEN_BLOCK}, got tokens={tokens}"
+            )
+        device = input_mixes.device
+        flat = input_mixes.reshape(tokens, total_mix).float().contiguous()
+        # Keyword arguments throughout: an upstream reorder/rename then fails loudly
+        # instead of silently swapping the two float scalars (post_mult vs eps).
+        pre = torch.zeros((tokens, mhc_mult), dtype=torch.float32, device=device)
+        post = torch.zeros((tokens, mhc_mult), dtype=torch.float32, device=device)
+        comb = torch.zeros((tokens, mhc_mult * mhc_mult), dtype=torch.float32, device=device)
+        mhc_pre_split_mixes_fwd(
+            input_mixes=flat,
+            mhc_scale=mhc_scale.reshape(-1).float().contiguous(),
+            mhc_base=mhc_base.reshape(-1).float().contiguous(),
+            pre_layer_mix=pre,
+            post_layer_mix=post,
+            comb_res_mix=comb,
+            mhc_post_mult_value=float(mhc_post_mult_value),
+            mhc_pre_eps=float(mhc_pre_eps),
+        )
+        return (
+            pre.reshape(*batch_shape, mhc_mult, 1),
+            post.reshape(*batch_shape, mhc_mult, 1),
+            comb.reshape(*batch_shape, mhc_mult, mhc_mult),
+        )
+
+    return split
+
+
+@lru_cache(maxsize=1)
+def _load_apply_v41():
+    """V4.1-only adapter over the TileKernels pre-apply-mix kernel.
+
+    ``mhc_pre_apply_mix_fwd(x[T, hc, D], mix[T, hc], out[T, D])`` collapses the
+    residual branches; this closure allocates ``out`` in bf16 (the model stream
+    dtype) and restores the leading batch/sequence dims.
+    """
+
+    try:
+        from tile_kernels.mhc.pre_apply_mix_kernel import mhc_pre_apply_mix_fwd
+    except (ImportError, OSError) as error:
+        raise RuntimeError(
+            "TileLang V4.1 HcPre requires the installed tile_kernels package and a loaded CANN environment"
+        ) from error
+
+    def apply(x: torch.Tensor, mix: torch.Tensor) -> torch.Tensor:
+        if x.dtype is not torch.bfloat16:
+            raise RuntimeError(f"TileLang V4.1 HcPre apply requires bf16 activations, got {x.dtype}")
+        batch_shape = tuple(x.shape[:-2])
+        heads, hidden = x.shape[-2], x.shape[-1]
+        tokens = x.numel() // (heads * hidden)
+        x3 = x.reshape(tokens, heads, hidden).to(torch.bfloat16).contiguous()
+        mix2 = mix.reshape(tokens, heads).float().contiguous()
+        # The kernel writes every element per token and does not block the token dim,
+        # so an uninitialized ``out`` is fully covered.
+        out = torch.empty((tokens, hidden), dtype=torch.bfloat16, device=x.device)
+        mhc_pre_apply_mix_fwd(x=x3, mix=mix2, o=out)
+        return out.reshape(*batch_shape, hidden).to(x.dtype)
+
+    return apply
 
 
 @torch.library.custom_op(
@@ -63,7 +165,7 @@ def tilelang_mhc_pre_v41_fwd_op(
     rsqrt = torch.rsqrt(x_float.square().mean(-1, keepdim=True) + norm_eps)
     mixes = F.linear(x_float, hc_fn.float()) * rsqrt
 
-    split = _load_split()
+    split = _load_split_v41()
     pre, post, comb = split(mixes, hc_scale.float(), hc_base.float(), hc_mult, 2.0, eps)
     comb, sinkhorn_norm, sinkhorn_sum = torch_npu.npu_mhc_sinkhorn(
         comb,
@@ -71,9 +173,9 @@ def tilelang_mhc_pre_v41_fwd_op(
         num_iters=sinkhorn_iters,
         out_flag=1,
     )
-    layer_input = _load_apply()(x, pre_mix.unsqueeze(-1))
+    layer_input = _load_apply_v41()(x, pre_mix.unsqueeze(-1))
     return (
-        layer_input.to(x.dtype),
+        layer_input,
         pre.squeeze(-1).clone(),
         post.squeeze(-1).clone(),
         comb,
