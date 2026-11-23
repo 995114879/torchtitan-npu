@@ -3,9 +3,19 @@
 
 import subprocess
 import sys
+from importlib.metadata import PackageNotFoundError, distribution
+from importlib.util import find_spec
+
+import pytest
 
 
 def test_patch_rebinds_preloaded_consumers_and_is_idempotent():
+    if find_spec("torchft") is None:
+        try:
+            distribution("torchft")
+        except PackageNotFoundError:
+            pytest.skip("TorchFT is optional; install it with pip install -e '.[torchft]'")
+
     program = """
 from unittest.mock import Mock, patch
 import sys
@@ -40,7 +50,8 @@ with patch.object(accelerator.dist.Backend, 'register_backend') as register, \\
     assert group._register('dp_replicate') == 'torchft-hccl:dp_replicate'
     assert register.call_args.kwargs['devices'] == ['cpu', 'npu']
 """
-    subprocess.run([sys.executable, "-c", program], check=True, capture_output=True, text=True, timeout=120)
+    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
 
 
 def test_plain_import_does_not_require_torchft_and_opt_in_explains_installation():
