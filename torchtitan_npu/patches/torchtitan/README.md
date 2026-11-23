@@ -12,6 +12,7 @@
 - https://github.com/pytorch/torchtitan/pull/4708
 - https://github.com/pytorch/torchtitan/pull/4763
 - https://github.com/pytorch/torchtitan/pull/4934
+- https://github.com/pytorch/torchtitan/pull/6290
 - https://github.com/pytorch/pytorch/pull/201621
 -->
 
@@ -65,6 +66,7 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | [#4934](https://github.com/pytorch/torchtitan/pull/4934) | FSDP unshard 去重时优先保留有消费者的输出，避免将 FP8 量化结果替换为未使用的 BF16 输出，对应 `experiments/graph_trainer/fsdp_passes.py` |
 | [#201621](https://github.com/pytorch/pytorch/pull/201621) | 为本地 FileSystemReader 增加可选 mmap 加载，对应 `distributed/checkpoint/filesystem` |
 | [#6180](https://github.com/pytorch/torchtitan/pull/6180) | 回移 override 成功日志分组，对应 `config/override.py` |
+| [#6290](https://github.com/pytorch/torchtitan/pull/6290) | 将 `debug.print_config` 配置打印压缩为无损扁平折叠 JSON，对应 `config/format.py` 和 `trainer.py` |
 
 上述 7 个 TorchTitan PR（#4534、#4575、#4578、#4598、#4663、#4664、#4934）已在上游合入，但 `v0.3.0` 尚未包含这些修复。
 
