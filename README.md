@@ -259,7 +259,7 @@ torchtitan-npu/
 │   │   ├── mx_storage_reader/     # MX 量化权重读取能力
 │   │   └── novaswap/              # NovaSwap 显存交换扩展
 │   ├── override/                  # 配置级组件替换，含 common 与模型专属目录
-│   ├── models/                    # 模型实现与并行化（DeepSeek-V3.2/V4/V4.1、Qwen3.5）
+│   ├── models/                    # 模型实现与并行化（DeepSeek-V3.2/V4/V4.1、Qwen3.5、Gemma3）
 │   ├── ops/                       # CANN 与 NPU 专属算子封装
 │   │   ├── ascendc/               # AscendC 算子适配（导入时自动加载）
 │   │   ├── misc/                  # 杂项算子

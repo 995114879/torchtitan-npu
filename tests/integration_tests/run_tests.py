@@ -39,6 +39,7 @@ from tests.integration_tests.deepseek_v4_1 import (
     build_deepseek_v4_1_test_list,
 )
 from tests.integration_tests.ema import assert_ema_checkpoint_written, build_ema_test_list
+from tests.integration_tests.gemma3 import build_gemma3_test_list
 from tests.integration_tests.loss_compare import (
     assert_losses_equal,
     compare_checkpoint_metrics,
@@ -101,6 +102,7 @@ _TEST_SUITES_FUNCTION = {
     "deepseek_v4_1_engram_cp": build_engram_cp_test_list,
     "qwen3_5": build_qwen3_5_test_list,
     "qwen3_5_quantized": build_qwen3_5_quantized_test_list,
+    "gemma3": build_gemma3_test_list,
 }
 
 # Held while a test writes its captured output so concurrent tests do not

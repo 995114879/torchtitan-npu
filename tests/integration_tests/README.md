@@ -53,6 +53,7 @@ python -m tests.integration_tests.run_tests \
 * **`deepseek_v4_1_fused`**：DeepSeek-V4.1 多模态打包/融合与 Muon 冒烟，需 vision fixture，单独运行；
 * **`deepseek_v4_1_engram_hf`**：DeepSeek-V4.1 Engram MXFP8 专项校验与 DCP/HF 权重回环测试。
 * **`qwen3_5_quantized`**：Qwen3.5 dense `W4A8_MXFP`/`W8A8_MXFP8` 量化训练冒烟，需支持的 A5 设备、运行时和 TorchAO-NPU。
+* **`gemma3`**：Gemma3 文本 SFT 的双卡 FSDP2、FullAC、HF 加载、训练更新和 DCP 保存；作为专用 suite 运行，不纳入默认 `models` suite。
 
 #### 核心用例清单矩阵
 
