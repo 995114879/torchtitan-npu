@@ -31,8 +31,12 @@ def register_group(
     return SwapRegistry.register_group(tuple(tensors), tensor_name)
 
 
-def pop_tensor_by_name(tensor_name: str):
-    SwapEngine.remove(tensor_name)
+def pop_tensor_by_name(tensor_name: str, *, device_waited: bool = False):
+    """Return a payload, optionally retiring its WAIT_DEVICE-protected H2D asynchronously."""
+    if device_waited:
+        SwapEngine.remove_device_waited(tensor_name)
+    else:
+        SwapEngine.remove(tensor_name)
     entry = SwapRegistry.pop_entry_by_name(tensor_name)
     return None if entry is None else entry.payload
 

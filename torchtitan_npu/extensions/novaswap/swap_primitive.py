@@ -56,18 +56,23 @@ def validate_tensor_for_swap(tensor: torch.Tensor) -> None:
         )
 
 
-def _logical_storage(tensor: torch.Tensor):
-    """Return the byte storage range occupied by a contiguous tensor view."""
-    nbytes = _logical_nbytes(tensor)
-    storage = tensor.untyped_storage()
-    offset = tensor.storage_offset() * tensor.element_size()
-    if offset == 0 and storage.size() == nbytes:
-        return storage
-    return storage[offset : offset + nbytes]
-
-
 def _copy_logical_storage(source: torch.Tensor, destination: torch.Tensor) -> None:
-    _logical_storage(destination).copy_(_logical_storage(source), non_blocking=True)
+    # Keep the original storage and its allocator context for pooled CPU views.
+    # Slicing UntypedStorage loses pinned-allocation recognition on older
+    # torch_npu runtimes and silently makes non_blocking copies synchronize.
+    source_bytes = torch.empty(0, dtype=torch.uint8, device=source.device).set_(
+        source.untyped_storage(),
+        source.storage_offset() * source.element_size(),
+        (_logical_nbytes(source),),
+        (1,),
+    )
+    destination_bytes = torch.empty(0, dtype=torch.uint8, device=destination.device).set_(
+        destination.untyped_storage(),
+        destination.storage_offset() * destination.element_size(),
+        (_logical_nbytes(destination),),
+        (1,),
+    )
+    destination_bytes.copy_(source_bytes, non_blocking=True)
 
 
 def d2h_group(

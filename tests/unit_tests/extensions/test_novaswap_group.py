@@ -10,7 +10,7 @@ import torch
 from torchtitan_npu.extensions.novaswap import swap_api
 from torchtitan_npu.extensions.novaswap import swap_engine as product_engine
 from torchtitan_npu.extensions.novaswap.swap_ir import SwapAction
-from torchtitan_npu.extensions.novaswap.swap_primitive import SwapGroupHandle
+from torchtitan_npu.extensions.novaswap.swap_primitive import SwapGroupHandle, _copy_logical_storage
 from torchtitan_npu.extensions.novaswap.swap_registry import SwapRegistry
 
 
@@ -106,3 +106,16 @@ def test_release_npu_releases_every_group_member():
 
     assert first.untyped_storage().size() == 0
     assert second.untyped_storage().size() == 0
+
+
+def test_storage_copy_does_not_bump_destination_autograd_version():
+    value = torch.arange(4.0, requires_grad=True)
+    expected = value.detach().clone()
+    loss = value.square().sum()
+    version = value._version
+
+    _copy_logical_storage(expected, value)
+
+    assert value._version == version
+    loss.backward()
+    torch.testing.assert_close(value.grad, 2 * expected)

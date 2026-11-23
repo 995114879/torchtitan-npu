@@ -397,6 +397,35 @@ class SwapEngine:
         release_worker.wait_for_name(tensor_name, release_target="npu")
 
     @classmethod
+    def remove_device_waited(cls, tensor_name: str) -> None:
+        """Retire consumed H2D handles without synchronizing the host thread."""
+        handles = cls._handles.get(tensor_name)
+        if handles is None or not all(handle.transfer == "H2D" and handle.device_waited for handle in handles):
+            raise AssertionError(f"Asynchronous removal requires WAIT_DEVICE for {tensor_name!r}")
+        release_worker = cls._release_worker
+        if release_worker is None:
+            raise RuntimeError("SwapEngine release worker is not initialized")
+        current_stream = torch_npu.npu.current_stream()
+        for handle in handles:
+            if handle.tensor_npu is not None:
+                # H2D allocates on the prefetch path; protect queued consumers
+                # when checkpoint drops the Python tensor after recomputation.
+                handle.tensor_npu.record_stream(current_stream)
+        cls._handles.pop(tensor_name)
+        for handle in handles:
+            # Retain only the CPU source until H2D completes. Holding the whole
+            # handle here would keep consumed activations resident on the NPU.
+            retired = SwapHandle(
+                tensor_cpu=handle.tensor_cpu,
+                swap_event=handle.swap_event,
+                is_completed=handle.is_completed,
+                owner=handle.owner,
+                transfer="H2D",
+            )
+            handle.tensor_cpu = None
+            release_worker.enqueue(tensor_name, retired, "cpu")
+
+    @classmethod
     def remove(cls, tensor_name: str) -> None:
         handles = cls._handles.pop(tensor_name, None)
         first_error: Exception | None = None

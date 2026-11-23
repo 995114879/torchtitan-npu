@@ -315,6 +315,12 @@ class TrainingExtensionConfig:
 class TrainingConfig(_BaseTrainingConfig):
     """Training options that are specific to NPU execution."""
 
+    enable_activation_offload: bool = False
+    """Offload FullAC layer-boundary activations to host memory."""
+
+    activation_offload_min_bytes: int = 1 << 20
+    """Minimum eligible activation size for the first offload prototype."""
+
     extension: TrainingExtensionConfig = field(
         default_factory=TrainingExtensionConfig,
     )

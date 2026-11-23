@@ -9,9 +9,10 @@
 from copy import copy
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torchtitan.config import derive
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
 
@@ -35,6 +36,9 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import A
 from .tools.profiler import CANNProfiler
 from .distributed.cp_exchange import install as install_cp_exchange
 from .distributed.expert_replication import shard_experts_across_replicas
+
+if TYPE_CHECKING:
+    from torchtitan_npu.extensions.cpu_offload.activation_offload import ActivationBoundaryOffload
 
 
 def set_allow_hf32(allow: bool) -> None:
@@ -258,6 +262,21 @@ class TrainerEx(Trainer):
 
         self.anticipatory_schedule = AnticipatorySchedule(self) if config.anticipatory.enable else None
 
+        self.activation_offload: ActivationBoundaryOffload | None = None
+        if getattr(config.training, "enable_activation_offload", False):
+            from torchtitan_npu.extensions.cpu_offload import activation_offload
+
+            if not isinstance(config.activation_checkpoint, FullAC.Config):
+                raise ValueError("--training.enable-activation-offload requires eager FullAC activation checkpointing")
+            if config.parallelism.pipeline_parallel_degree > 1:
+                raise ValueError("--training.enable-activation-offload does not support pipeline parallelism")
+            if config.compile.enable:
+                raise ValueError("--training.enable-activation-offload requires eager execution")
+            self.activation_offload = activation_offload.ActivationBoundaryOffload(
+                min_tensor_bytes=config.training.activation_offload_min_bytes,
+            )
+            self.activation_offload.install(self.model_parts)
+
         # CPU affinity runs last: every runtime thread it manages (acl /
         # release / watchdog / CANN internals) is born by now, so binding
         # here cannot propagate a narrow mask to threads that do not exist
@@ -269,7 +288,12 @@ class TrainerEx(Trainer):
     def forward_backward_step(self, *args: Any, **kwargs: Any) -> Any:
         if self.anticipatory_schedule is not None:
             self.anticipatory_schedule.prepare_microbatch()
-        result = super().forward_backward_step(*args, **kwargs)
+        activation_offload = getattr(self, "activation_offload", None)
+        if activation_offload is None:
+            result = super().forward_backward_step(*args, **kwargs)
+        else:
+            with activation_offload.microbatch():
+                result = super().forward_backward_step(*args, **kwargs)
         if self.anticipatory_schedule is not None:
             self.anticipatory_schedule.accumulate_microbatch_loss(result)
         # Advancing SDC state after a failed or partial step would corrupt its
@@ -295,6 +319,9 @@ class TrainerEx(Trainer):
         return super().batch_generator(data_iterable)
 
     def close(self) -> None:
+        activation_offload = getattr(self, "activation_offload", None)
+        if activation_offload is not None:
+            activation_offload.close()
         super().close()
         affinity = getattr(self, "affinity", None)
         if affinity is not None:
