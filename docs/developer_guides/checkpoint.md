@@ -9,7 +9,8 @@
 - DCP（Distributed Checkpoint）用于保存和加载分布式训练状态。
 - Hugging Face safetensors 只用于模型权重的加载或保存，不能加载优化器和训练步数。
 
-本文不覆盖权重转换工具。需要转换 Hugging Face 权重时，使用上游仓库提供的转换工具。
+除下文「导出 vLLM Ascend 量化权重」外，本文不覆盖其他权重转换工具。需要转换 Hugging Face 权重时，
+使用上游仓库提供的转换工具。
 
 ## 当前配置入口
 
@@ -247,6 +248,108 @@ bash scripts/run_train.sh \
 `last_save_in_hf` 需要模型提供 state-dict adapter，并且必须保持
 `last_save_model_only=True`。`deepseek_v3_2` 和 `deepseek_v4` 模型均提供
 对应的 state-dict adapter；具体可用性仍取决于模型配置和权重格式。
+
+## 导出 vLLM Ascend 量化权重
+
+`torchtitan_npu/tools/checkpoint_conversion/export_quantized_vllm.py` 是离线导出工具：读取训练
+checkpoint 的 master 权重，按量化计划重新量化，写出 vLLM Ascend 可直接加载的 Hugging Face
+safetensors。量化权重是普通的 `weight` 与 `weight_scale` 张量，逐参数类型写在
+`quant_model_description.json`（ModelSlim 格式），serving 时对应 `--quantization ascend`。
+
+输入可以是 DCP 或 HF safetensors：DCP 覆盖 `deepseek_v4`、`deepseek_v4_1`、`qwen3_5`；HF 只支持
+Qwen3.5，DeepSeek 的 HF 发布件本身是 fp8/fp4 量化格式，必须从 DCP 导出。工具为单进程程序：
+DCP 读取与命名转换在 CPU 上完成，量化 kernel 在 `--quant_device` 指定的 NPU 上执行，运行前需要
+`torch_npu`、CANN 和可用的 Ascend NPU 环境。
+
+### 快速开始
+
+`--hf_assets_path` 指向 HF 发布件目录（`config.json`、tokenizer，以及 DCP 导出时用于补齐冻结
+视觉塔的 `*.safetensors`；所选模型配置不含视觉模块、但 serving 需要视觉塔时加 `--needs_vision`），
+非权重文件会复制到输出目录。DeepSeek 的 `config.json` 复制后会把结构字段（层数、专家数、
+hidden/intermediate/vocab、rope 等）按 `--model_flavor` 的模型配置改写，因此导出裁剪层数或专家数
+的 flavor 时不会残留发布件的完整规格；模型配置未声明的字段保持 assets 原值。视觉开关另行按导出
+的张量集对齐：DeepSeek 的 `vision_n_layers` 在导出没有视觉塔时置为 0，有视觉塔但配置为 0 时保留
+原值并告警；Qwen3.5 声明 `vision_config` 而导出没有视觉塔时直接报错。Qwen3.5 的配置项在嵌套的
+`text_config` 中，暂不改写，保持 assets 原样。运行后先核对日志中的 `plan: ...`（显式 `--recipe`
+时为 `recipe=... plan: ...`，回放 DCP 配置时为 `DCP replay plan: ...`）与 `Quantized N/M tensors`。
+
+DeepSeek-V4.1，DCP 输入，回放 checkpoint 内嵌的量化配置：
+
+```bash
+python -m torchtitan_npu.tools.checkpoint_conversion.export_quantized_vllm \
+  /absolute/path/to/dump/checkpoint/step-100 \
+  ./outputs/vllm_quantized \
+  --hf_assets_path /path/to/DeepSeek-V4.1 \
+  --model_name deepseek_v4_1 \
+  --model_flavor deepseek_v4_1_flash
+```
+
+Qwen3.5，HF safetensors 输入，必须显式指定 recipe：
+
+```bash
+python -m torchtitan_npu.tools.checkpoint_conversion.export_quantized_vllm \
+  /path/to/Qwen3.5-27B \
+  ./outputs/qwen35_quantized \
+  --hf_assets_path /path/to/Qwen3.5-27B \
+  --model_name qwen3_5 \
+  --model_flavor 27B \
+  --recipe W4A8_MXFP
+```
+
+### 量化层与 recipe
+
+量化范围由训练 recipe 的 filter 决定（训练侧的层选择规则见
+[低精度训练](../feature_guides/low_precision_training.md)），不按「所有 Linear」推断。导出侧在
+`vllm_export_specs.py` 的 `QUANTIZATION_EXPORT_RULES` 中把训练 FQN 后缀换成 HF 名字后缀，只有命中
+的张量在描述文件中是非 `FLOAT` 条目，清单以该表为准（V4.1 Engram 表是例外，见
+[输出与校验](#输出与校验)）：
+
+- `deepseek_v4`：`DEEPSEEK_V4_DENSE_WEIGHT_SUFFIXES`；routed expert 由 `ROUTED_WEIGHT_PATTERN` 匹配。
+- `deepseek_v4_1`：`DEEPSEEK_V41_DENSE_WEIGHT_SUFFIXES`，在 V4 的清单上增加 `.engram.wkv`。
+- `qwen3_5`：`QWEN35_DENSE_WEIGHT_SUFFIXES`，无 routed expert。
+
+其余权重（embedding 与输出层、norm、MoE router、vision 塔、MTP，以及 Qwen3.5 的 `conv1d` 与 MoE
+专家）不量化，在描述文件中记为 `FLOAT`。
+
+量化类型由 recipe 的权重量化配置推导（`vllm_export_contract.py` 的 `quant_description_type`）：
+
+| recipe | 量化类型 |
+| --- | --- |
+| `all_mxfp8`、`mix`、`all_block_fp8` | `W8A8_MXFP8` |
+| `mix`、`all_block_fp8` + `--enable_mxfp4_qat` | routed expert 为 `W4A8_MXFP`，dense 仍为 `W8A8_MXFP8` |
+| `W4A8_MXFP`（Qwen3.5，内置 MXFP4） | `W4A8_MXFP` |
+| `W8A8_MXFP8`（Qwen3.5） | `W8A8_MXFP8` |
+| `all_hif8` | 不支持，构建计划阶段报错 |
+
+表中的类型是 `quant_model_description.json` 里每个权重的条目；顶层 `model_quant_type` 只有在所有
+命中的权重都是 FP4 时才是 `W4A8_MXFP`，混合导出（`mix`、`all_block_fp8` + `--enable_mxfp4_qat`）
+顶层仍记 `W8A8_MXFP8`。`--enable_mxfp4_qat` 只作用于 DeepSeek `mix`/`all_block_fp8` 的 routed
+expert，`all_mxfp8` 与 Qwen3.5 的 recipe 不读取该开关（Qwen3.5 `W4A8_MXFP` 固有启用）。
+
+省略 `--recipe` 时工具回放 DCP 中 `torchao_npu` wrapper 记录的逐参数配置：Qwen3.5 的
+`in_proj_q/k/v` 融合成 `in_proj_qkv` 前会校验三份配置齐全且一致；训练未包成 Linear 的
+serving-only 权重（V4.1 `.engram.wkv`）借用 dense 配置；任何量化目标缺配置都会报错，而不是导出
+与训练不一致的权重。回放模式下传入 `--enable_mxfp4_qat` 或 `--dst_type_max` 会报错，需改用
+`--recipe`。
+
+### 输出与校验
+
+输出目录包含模型 shard（`model.safetensors` 或 `model-*-of-*.safetensors`）、
+`quant_model_description.json` 和从 `--hf_assets_path` 复制的配置文件；多 shard 或含 Engram 表时
+还会生成 `model.safetensors.index.json`。输出目录不能残留上一次导出的权重或索引文件，否则直接
+报错。导出只包含模型权重与量化描述，不含优化器和训练状态。未量化权重在描述文件中记为 `FLOAT`；
+DCP 输入时其 dtype 按 HF 发布件的原生 dtype 还原，读不到发布件的 tensor header 或 dtype 不兼容时
+保留 DCP dtype 并告警。V4.1 Engram 表按 vLLM Ascend 的逐行 MXFP8 布局导出：
+`layers.<n>.engram.embed.weight` 为 `float8_e4m3fn`，同前缀的 `.scale` 为 `float8_e8m0fnu`，
+每行每 32 个元素一个 scale；这两类张量不在 `quant_model_description.json` 里逐项记录，只写一条
+`layers.<n>.engram.embed.quant_type: "MXFP8"` 元数据，vLLM Ascend 的 Engram loader 直接读
+safetensors dtype 与 index。
+
+写盘后工具自检 dtype、scale 形状、描述条目、shard 张量集合与 `config.json`；不满足 vLLM Ascend
+加载约定时报错并删除本次写出的权重文件。复制过来的 `quantization_config` 保持 assets 原样：其中
+声明的 `quant_method`（如 fp8）不会改写成导出格式，自检只记录警告，serving 时必须用
+`--quantization ascend` 覆盖。`--keep_scale_tail_dim` 保留 kernel 的
+`(..., ceil(blocks/2), 2)` scale 布局，只能用于检查，不能直接 serving。其余参数见 `--help`。
 
 ## 创建 seed checkpoint
 

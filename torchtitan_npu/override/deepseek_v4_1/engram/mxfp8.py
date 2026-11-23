@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+__all__ = ["MXFP8HostOffloadEngramTable", "quantize_mxfp8_rows"]
+
 from dataclasses import dataclass
 
 import torch
@@ -21,8 +23,12 @@ _E8M0_MAX_EXPONENT = 127
 
 
 @torch.no_grad()
-def _quantize_mxfp8_rows(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize rows to the E4M3 data and E8M0 per-32 scale format."""
+def quantize_mxfp8_rows(rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize rows to the E4M3 data and E8M0 per-32 scale format.
+
+    Public so the checkpoint exporters can reuse the training-time quantizer and
+    produce storage byte-identical to what this table writes during training.
+    """
     if rows.ndim != 2 or rows.shape[1] % _MXFP8_BLOCK_SIZE:
         raise ValueError(
             f"MXFP8 Engram rows must be 2D with width divisible by {_MXFP8_BLOCK_SIZE}, got {tuple(rows.shape)}."
@@ -115,7 +121,7 @@ class MXFP8HostOffloadEngramTable(HostOffloadEngramTable):
             row_ids = row_ids.reshape(-1).to(device="cpu", dtype=torch.int64)
             if row_ids.numel() == 0:
                 return
-            quantized, row_scale = _quantize_mxfp8_rows(self.weight.index_select(0, row_ids))
+            quantized, row_scale = quantize_mxfp8_rows(self.weight.index_select(0, row_ids))
             # CPU index_copy does not dispatch for float8 yet. Both formats use
             # one byte per element, so update their storage through byte views.
             storage.view(torch.uint8).index_copy_(0, row_ids, quantized.view(torch.uint8))
@@ -124,7 +130,7 @@ class MXFP8HostOffloadEngramTable(HostOffloadEngramTable):
 
         for start in range(0, self.weight.shape[0], self.quantization_chunk_rows):
             end = min(start + self.quantization_chunk_rows, self.weight.shape[0])
-            quantized, row_scale = _quantize_mxfp8_rows(self.weight[start:end])
+            quantized, row_scale = quantize_mxfp8_rows(self.weight[start:end])
             storage[start:end].copy_(quantized)
             scale[start:end].copy_(row_scale)
 
@@ -146,6 +152,3 @@ class MXFP8HostOffloadEngramTable(HostOffloadEngramTable):
             indices = row_ids.reshape(-1).to(dtype=torch.int32).contiguous()
             fetched, fetched_scale, fetch = buffer.engram_fetch(indices)()
             return _dequantize_mxfp8_rows(fetched, fetched_scale), fetch
-
-
-__all__ = ["MXFP8HostOffloadEngramTable"]

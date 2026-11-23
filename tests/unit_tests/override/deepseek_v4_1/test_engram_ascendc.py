@@ -173,7 +173,7 @@ def test_mxfp8_override_refreshes_derived_storage(monkeypatch):
     ).build(model_parts=[table])
     container.step()
     assert table.pending_sparse_grad() is None
-    expected_storage, expected_scale = mxfp8._quantize_mxfp8_rows(table.weight)
+    expected_storage, expected_scale = mxfp8.quantize_mxfp8_rows(table.weight)
     torch.testing.assert_close(storage.float(), expected_storage.float(), rtol=0, atol=0)
     torch.testing.assert_close(scale.float(), expected_scale.float(), rtol=0, atol=0)
     torch.testing.assert_close(storage[1].float(), untouched_storage.float(), rtol=0, atol=0)
@@ -181,7 +181,7 @@ def test_mxfp8_override_refreshes_derived_storage(monkeypatch):
 
     loaded = {"weight": torch.full_like(table.weight, 0.125)}
     table.load_state_dict(loaded)
-    expected_storage, expected_scale = mxfp8._quantize_mxfp8_rows(table.weight)
+    expected_storage, expected_scale = mxfp8.quantize_mxfp8_rows(table.weight)
     torch.testing.assert_close(storage.float(), expected_storage.float(), rtol=0, atol=0)
     torch.testing.assert_close(scale.float(), expected_scale.float(), rtol=0, atol=0)
 

@@ -723,7 +723,7 @@ def test_inject_torchao_quant_config_without_record_skips(export, tmp_path, capl
 
 
 # =========================================================================
-# _model_derived_config_fields / _apply_model_derived_config
+# model_derived_config_fields / apply_model_derived_config
 # =========================================================================
 
 _NS = types.SimpleNamespace
@@ -779,7 +779,7 @@ def _dsv4_like_config():
 
 
 def test_model_derived_config_fields_maps_dsv4_truth(export):
-    fields = export._model_derived_config_fields(_dsv4_like_config())
+    fields = export.model_derived_config_fields(_dsv4_like_config())
     assert fields["num_hidden_layers"] == 4
     assert fields["num_nextn_predict_layers"] == 0
     assert fields["tie_word_embeddings"] is False
@@ -816,14 +816,14 @@ def test_model_derived_config_max_position_follows_release_window(export):
         rope = layer.attention.rope
         if getattr(rope, "scaling", None) == "yarn":
             rope.rope_factor = 16.0
-    fields = export._model_derived_config_fields(cfg)
+    fields = export.model_derived_config_fields(cfg)
     assert fields["max_position_embeddings"] == 1048576
 
 
 def test_model_derived_config_fields_unknown_ratio_skips_layer_types(export):
     """A compress_ratio the HF table does not name yields no layer_types guess."""
     cfg = _NS(vocab_size=1, dim=1, mtp_layers=[], layers=[_NS(attention=_NS(compress_ratio=2))])
-    fields = export._model_derived_config_fields(cfg)
+    fields = export.model_derived_config_fields(cfg)
     assert fields["compress_ratios"] == [2]
     assert "layer_types" not in fields
 
@@ -831,7 +831,7 @@ def test_model_derived_config_fields_unknown_ratio_skips_layer_types(export):
 def test_model_derived_config_fields_skips_unbacked_structures(export):
     """Absent or partial moe/indexer/hc sub-configs emit only the fields they actually back."""
     cfg = _NS(vocab_size=32, dim=8, layers=[_NS(attention=_NS(n_heads=2, head_dim=4))])
-    assert export._model_derived_config_fields(cfg) == {
+    assert export.model_derived_config_fields(cfg) == {
         "vocab_size": 32,
         "hidden_size": 8,
         "num_hidden_layers": 1,
@@ -841,7 +841,7 @@ def test_model_derived_config_fields_skips_unbacked_structures(export):
 
     moe = _NS(num_experts=4, shared_experts=None)
     cfg = _NS(vocab_size=32, dim=8, layers=[_NS(attention=_NS(n_heads=2, head_dim=4), moe=moe)])
-    fields = export._model_derived_config_fields(cfg)
+    fields = export.model_derived_config_fields(cfg)
     assert fields["n_routed_experts"] == 4
     assert fields["n_shared_experts"] == 0
     assert not {"num_experts_per_tok", "moe_intermediate_size", "scoring_func"} & set(fields)
@@ -863,7 +863,7 @@ def test_apply_model_derived_config_rewrites_and_preserves(export, tmp_path):
         )
     )
 
-    export._apply_model_derived_config(out, _dsv4_like_config())
+    export.apply_model_derived_config(out, _dsv4_like_config())
 
     config = json.loads((out / "config.json").read_text())
     assert config["n_routed_experts"] == 4  # asset number replaced by the model's truth
@@ -878,6 +878,25 @@ def test_apply_model_derived_config_rewrites_and_preserves(export, tmp_path):
     assert config["rope_scaling"] == {"type": "yarn"}
     # alt-spelling fields the asset omits (official release layout) stay absent
     assert not {"layer_types", "mlp_layer_types", "rope_parameters"} & set(config)
+
+
+def test_apply_model_derived_config_updates_nested_expert_count(export, tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["DeepseekV4ForCausalLM"],
+                "text_config": {"n_routed_experts": 384},
+            }
+        )
+    )
+
+    export.apply_model_derived_config(out, _dsv4_like_config())
+
+    config = json.loads((out / "config.json").read_text())
+    assert config["text_config"]["n_routed_experts"] == 4
+    assert "n_routed_experts" not in config
 
 
 def test_apply_model_derived_config_syncs_carried_alt_spellings(export, tmp_path):
@@ -908,7 +927,7 @@ def test_apply_model_derived_config_syncs_carried_alt_spellings(export, tmp_path
         )
     )
 
-    export._apply_model_derived_config(out, _dsv4_like_config())
+    export.apply_model_derived_config(out, _dsv4_like_config())
 
     config = json.loads((out / "config.json").read_text())
     # same length as compress_ratios, distribution follows the model's compress ratios
@@ -957,7 +976,7 @@ def test_apply_model_derived_config_syncs_legacy_rope_scaling(export, tmp_path):
         )
     )
 
-    export._apply_model_derived_config(out, _dsv4_like_config())
+    export.apply_model_derived_config(out, _dsv4_like_config())
 
     config = json.loads((out / "config.json").read_text())
     assert config["compress_rope_theta"] == 40000.0
@@ -972,7 +991,7 @@ def test_apply_model_derived_config_syncs_legacy_rope_scaling(export, tmp_path):
 
 def test_apply_model_derived_config_without_config_json_warns(export, tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="export_quantized_hf_under_test"):
-        export._apply_model_derived_config(tmp_path, _dsv4_like_config())
+        export.apply_model_derived_config(tmp_path, _dsv4_like_config())
     assert any("skipping model-derived" in r.getMessage() for r in caplog.records)
 
 
@@ -1251,6 +1270,38 @@ def test_train_fqn_to_hf_fqns_expands_templates(export, monkeypatch):
     assert all(p.weight_config is weight and p.activation_config is act for p in plan.values())
     with pytest.raises(ValueError, match="matches no exported tensor"):
         export.plan_from_dcp_configs({}, {"layers.77.attention.wq_a.weight": (weight, act)}, _StubAdapter())
+
+
+class _QwenAdapter:
+    """Qwen3.5 adapter: the split GDN projections are fused into ``in_proj_qkv``."""
+
+    from_hf_map = {
+        "model.language_model.layers.{}.linear_attn.in_proj_qkv.weight": None,
+        "model.language_model.layers.{}.linear_attn.in_proj_z.weight": "layers.{}.attn.in_proj_z.weight",
+    }
+
+
+def test_dcp_replay_maps_fused_qwen_projection(export, monkeypatch):
+    """The split in_proj_q/k/v configs land on the one fused HF ``in_proj_qkv`` weight."""
+    configs = types.ModuleType("torchao_npu.configs")
+    configs.ParamSwapConfig = _FakeParamSwap
+    monkeypatch.setitem(sys.modules, "torchao_npu.configs", configs)
+
+    fused_fqn = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight"
+    hf_state = {fused_fqn: 0}
+    to_hf = {v: k for k, v in _QwenAdapter.from_hf_map.items() if v is not None}
+    assert export._train_fqn_to_hf_fqns(
+        "layers.0.attn.in_proj_q.weight", to_hf, hf_state, export._QWEN35_FUSED_HF_FQNS
+    ) == [fused_fqn]
+
+    weight, act = object(), object()
+    plan = export.plan_from_dcp_configs(
+        hf_state,
+        {f"layers.0.attn.in_proj_{projection}.weight": (weight, act) for projection in ("q", "k", "v")},
+        _QwenAdapter(),
+    )
+    assert list(plan) == [fused_fqn]
+    assert plan[fused_fqn].weight_config is weight and plan[fused_fqn].activation_config is act
 
 
 def test_resolve_plan_routing_and_rejection(export, monkeypatch, caplog):

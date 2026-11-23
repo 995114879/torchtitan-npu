@@ -20,6 +20,7 @@ from __future__ import annotations
 import io
 import logging
 import pickle
+import re
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -32,6 +33,18 @@ logger = logging.getLogger(__name__)
 # Wrapper streams carry the pickled class path in their first GLOBAL opcodes.
 _WRAPPER_STREAM_MARKER = b"torchao_npu.wrapper_tensors"
 _PROBE_BYTES = 8192
+
+# Checkpoint buckets that hold training state instead of model parameters. A
+# quantized run also stores wrapper-typed tensors under these prefixes (EMA keeps
+# a detached clone per parameter), so extraction must skip them by default.
+DCP_TRAINING_STATE_PREFIXES = (
+    "optimizer.",
+    "lr_scheduler.",
+    "dataloader.",
+    "train_state.",
+    "rng_state.",
+    "ema_optimizer.",
+)
 
 
 def register_wrapper_safe_globals() -> None:
@@ -53,6 +66,11 @@ def register_wrapper_safe_globals() -> None:
 def extract_wrapper_configs(input_dir: Path) -> dict[str, tuple[Any, Any]]:
     """Map each FQN saved as a quantization wrapper (training namespace) to ``(weight_config, activation_config)``.
 
+    ``DCP_TRAINING_STATE_PREFIXES`` names the checkpoint buckets that hold training
+    state instead of model parameters (optimizer, EMA, ...). EMA stores a
+    detached clone of every parameter, which stays wrapper-typed and therefore
+    matches the stream probe; those entries are not model quantization configs.
+
     Plain streams are absent; an FQN's first recorded shard decides it (all
     shards serialize the same object).
     """
@@ -71,6 +89,8 @@ def extract_wrapper_configs(input_dir: Path) -> dict[str, tuple[Any, Any]]:
         if fqn is None or fqn in decided:
             continue
         decided.add(fqn)
+        if fqn.startswith(DCP_TRAINING_STATE_PREFIXES):
+            continue
         shard_path = input_dir / storage.relative_path
         if not shard_path.is_file():
             raise ValueError(f"DCP shard {shard_path} referenced by .metadata is missing")
@@ -103,3 +123,74 @@ def extract_wrapper_configs(input_dir: Path) -> dict[str, tuple[Any, Any]]:
         len(configs),
     )
     return configs
+
+
+def abstract_train_fqn(train_fqn: str) -> tuple[str, str | None]:
+    """Training FQN template with the layer index replaced by ``{}``, plus its layer number."""
+    layer_match = re.search(r"\d+", train_fqn)
+    abstract = re.sub(r"(\d+)", "{}", train_fqn, count=1)
+    if train_fqn.startswith("mtp_layers."):
+        abstract = abstract.replace("mtp_layers.{}.", "layers.{}.", 1)
+    return abstract, layer_match.group(0) if layer_match else None
+
+
+def _train_fqn_to_hf_fqns(
+    train_fqn: str,
+    to_hf_map: dict[str, str],
+    hf_state_dict,
+    fused_hf_fqns: dict[str, str] | None = None,
+) -> list[str]:
+    """Return HF names covered by one training-namespace wrapper FQN."""
+    is_mtp = train_fqn.startswith("mtp_layers.")
+    abstract, layer_num = abstract_train_fqn(train_fqn)
+
+    if train_fqn in to_hf_map:
+        hf_abstract = to_hf_map[train_fqn]
+    elif abstract in to_hf_map:
+        hf_abstract = to_hf_map[abstract]
+        if is_mtp:
+            hf_abstract = hf_abstract.replace("layers.{}.", "mtp.{}.", 1)
+    elif fused_hf_fqns is not None:
+        hf_abstract = fused_hf_fqns.get(abstract)
+        if hf_abstract is not None and is_mtp:
+            hf_abstract = hf_abstract.replace("layers.{}.", "mtp.{}.", 1)
+    else:
+        hf_abstract = None
+    if hf_abstract is None:
+        raise ValueError(
+            f"the checkpoint embeds a quantization config for {train_fqn!r}, but the state_dict adapter has no "
+            "HF name for it (see from_hf_map); --model_flavor may not match the checkpoint, or the adapter "
+            "needs a new entry to export it."
+        )
+    if "{}" not in hf_abstract:
+        return [hf_abstract] if hf_abstract in hf_state_dict else []
+    if layer_num is None:
+        return []
+    if hf_abstract.count("{}") == 1:
+        hf_fqn = hf_abstract.format(layer_num)
+        return [hf_fqn] if hf_fqn in hf_state_dict else []
+
+    # The second placeholder is the per-expert index.
+    pre, _, rest = hf_abstract.partition("{}")
+    mid, _, post = rest.partition("{}")
+    per_expert = re.compile("^" + re.escape(pre + layer_num + mid) + r"\d+" + re.escape(post) + "$")
+    return sorted(fqn for fqn in hf_state_dict if per_expert.match(fqn))
+
+
+def plan_from_dcp_configs(hf_state_dict, extracted, sd_adapter, *, fused_hf_fqns=None) -> dict[str, Any]:
+    """Map DCP wrapper configs onto the exported HF tensor names."""
+    from torchao_npu.configs import ParamSwapConfig
+
+    to_hf_map = {value: key for key, value in sd_adapter.from_hf_map.items() if value is not None}
+    plan: dict[str, Any] = {}
+    for train_fqn, (weight_config, activation_config) in extracted.items():
+        hf_fqns = _train_fqn_to_hf_fqns(train_fqn, to_hf_map, hf_state_dict, fused_hf_fqns)
+        if not hf_fqns:
+            raise ValueError(
+                f"the checkpoint embeds a quantization config for {train_fqn!r}, but its HF name mapping matches "
+                "no exported tensor; --model_flavor may not match the checkpoint."
+            )
+        swap_config = ParamSwapConfig(weight_config=weight_config, activation_config=activation_config)
+        for hf_fqn in hf_fqns:
+            plan[hf_fqn] = swap_config
+    return plan

@@ -158,7 +158,17 @@ def plan_from_recipe(hf_state_dict, *, recipe: str, enable_mxfp4_qat: bool, dst_
     return plan
 
 
-def _train_fqn_to_hf_fqns(train_fqn: str, to_hf_map: dict[str, str], hf_state_dict) -> list[str]:
+# ``to_hf`` fuses the split GDN projections into one HF ``in_proj_qkv`` tensor, so the
+# adapter maps that fused name (not the split ones) and the replay needs the fusion.
+_QWEN35_FUSED_HF_FQNS = {
+    f"layers.{{}}.attn.in_proj_{projection}.weight": ("model.language_model.layers.{}.linear_attn.in_proj_qkv.weight")
+    for projection in ("q", "k", "v")
+}
+
+
+def _train_fqn_to_hf_fqns(
+    train_fqn: str, to_hf_map: dict[str, str], hf_state_dict, fused_hf_fqns: dict[str, str] | None = None
+) -> list[str]:
     """HF export keys covered by one training-namespace FQN (inverse of the ``to_hf`` naming)."""
     is_mtp = train_fqn.startswith("mtp_layers.")
     layer_match = re.search(r"\d+", train_fqn)
@@ -170,6 +180,10 @@ def _train_fqn_to_hf_fqns(train_fqn: str, to_hf_map: dict[str, str], hf_state_di
     hf_abstract = to_hf_map.get(train_fqn)
     if hf_abstract is None:
         hf_abstract = to_hf_map.get(abstract)
+        if hf_abstract is not None and is_mtp:
+            hf_abstract = hf_abstract.replace("layers.{}.", "mtp.{}.", 1)
+    if hf_abstract is None and fused_hf_fqns is not None:
+        hf_abstract = fused_hf_fqns.get(abstract)
         if hf_abstract is not None and is_mtp:
             hf_abstract = hf_abstract.replace("layers.{}.", "mtp.{}.", 1)
     if hf_abstract is None:
@@ -196,10 +210,10 @@ def plan_from_dcp_configs(hf_state_dict, extracted, sd_adapter) -> dict[str, Any
     """Map the checkpoint-embedded configs onto HF names; unmapped configs raise."""
     from torchao_npu.configs import ParamSwapConfig
 
-    to_hf_map = {v: k for k, v in sd_adapter.from_hf_map.items()}
+    to_hf_map = {v: k for k, v in sd_adapter.from_hf_map.items() if v is not None}
     plan: dict[str, Any] = {}
     for train_fqn, (weight_config, activation_config) in extracted.items():
-        hf_fqns = _train_fqn_to_hf_fqns(train_fqn, to_hf_map, hf_state_dict)
+        hf_fqns = _train_fqn_to_hf_fqns(train_fqn, to_hf_map, hf_state_dict, _QWEN35_FUSED_HF_FQNS)
         if not hf_fqns:
             raise ValueError(
                 f"the checkpoint embeds a quantization config for {train_fqn!r}, but its HF name mapping matches "
@@ -484,7 +498,7 @@ def _is_hash_moe(layer) -> bool:
     return bool(getattr(getattr(layer.moe, "router", None), "hash", False))
 
 
-def _model_derived_config_fields(model_config) -> dict:
+def model_derived_config_fields(model_config) -> dict:
     """Structural ``config.json`` fields recomputed from the model config.
 
     The copied assets describe the release model the dir was packaged for
@@ -496,7 +510,7 @@ def _model_derived_config_fields(model_config) -> dict:
     ``layer_types`` / ``mlp_layer_types`` are spelled out from the same
     per-layer walk as ``compress_ratios`` / ``num_hash_layers``; whether they
     are written back depends on the asset schema (see
-    ``_apply_model_derived_config``).
+    ``apply_model_derived_config``).
     """
     fields: dict = {}
 
@@ -633,13 +647,18 @@ def _sync_rope_scaling(existing: dict, compress_rope) -> dict:
     return synced
 
 
-def _apply_model_derived_config(output_dir: Path, model_config) -> None:
-    """Overwrite the copied ``config.json`` structural fields with the exported model's truth."""
+def apply_model_derived_config(output_dir: Path, model_config) -> None:
+    """Overwrite the copied ``config.json`` structural fields with the exported model's truth.
+
+    Public so ``export_quantized_vllm.py`` aligns the config.json it copies from
+    the assets the same way instead of shipping a release config for a shrunken
+    flavor.
+    """
     config_path = output_dir / "config.json"
     if not config_path.is_file():
         logger.warning("no config.json in %s; skipping model-derived field rewrite", output_dir)
         return
-    derived = _model_derived_config_fields(model_config)
+    derived = model_derived_config_fields(model_config)
     config = json.loads(config_path.read_text())
     # layer_types/mlp_layer_types spell the same per-layer truth as
     # compress_ratios/num_hash_layers. Official assets omit them and let the
@@ -655,7 +674,31 @@ def _apply_model_derived_config(output_dir: Path, model_config) -> None:
     # top-level ``rope_scaling`` dict instead of ``rope_parameters.compress``.
     if isinstance(config.get("rope_scaling"), dict):
         derived["rope_scaling"] = _sync_rope_scaling(config["rope_scaling"], _find_rope_configs(layers)[1])
+
+    # DeepSeek assets use both flat and nested config schemas across releases.
+    # Keep the expert-count field in the schema the asset already carries; adding
+    # only a new top-level ``n_routed_experts`` leaves vLLM reading the stale
+    # nested ``text_config`` value.
+    expert_count = derived.pop("n_routed_experts", None)
+    expert_count_targets: list[str] = []
+    if expert_count is not None:
+        containers = [("", config)]
+        text_config = config.get("text_config")
+        if isinstance(text_config, dict):
+            containers.append(("text_config.", text_config))
+        for prefix, container in containers:
+            for key in ("n_routed_experts", "n_experts"):
+                if key in container:
+                    if container[key] != expert_count:
+                        expert_count_targets.append(f"{prefix}{key}")
+                    container[key] = expert_count
+        if not expert_count_targets and not any(
+            key in container for _, container in containers for key in ("n_routed_experts", "n_experts")
+        ):
+            derived["n_routed_experts"] = expert_count
+
     changed = sorted(k for k, v in derived.items() if config.get(k) != v)
+    changed.extend(expert_count_targets)
     config.update(derived)
     config_path.write_text(json.dumps(config, indent=2))
     logger.info(
@@ -1115,7 +1158,7 @@ def export_quantized_hf(args: argparse.Namespace) -> None:
 
     try:
         _copy_hf_assets(hf_assets_path, output_dir)
-        _apply_model_derived_config(output_dir, model_config)
+        apply_model_derived_config(output_dir, model_config)
         # The FqnToConfig keys are in-memory FQNs, so build the record after the relayout.
         fqn_to_config_record = _build_fqn_to_config_record(quantized_fqns)
         if fqn_to_config_record is not None:

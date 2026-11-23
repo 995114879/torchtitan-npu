@@ -18,11 +18,19 @@ from pathlib import Path
 import torch
 
 if __package__:
-    from .vllm_export_specs import EXPERT_FQN_RE, VISION_PREFIXES, VISION_TOWER_PREFIXES
+    from .vllm_export_specs import (
+        EXPERT_FQN_RE,
+        IMAGE_MARKER_PREFIX,
+        VISION_MARKER_NAMES,
+        VISION_PREFIXES,
+        VISION_TOWER_PREFIXES,
+    )
 else:
     # Script mode: the sibling module is on sys.path at runtime.
     from vllm_export_specs import (  # pyrefly: ignore [missing-import]
         EXPERT_FQN_RE,
+        IMAGE_MARKER_PREFIX,
+        VISION_MARKER_NAMES,
         VISION_PREFIXES,
         VISION_TOWER_PREFIXES,
     )
@@ -92,9 +100,13 @@ def build_quant_model_description(hf_state_dict, quantized_fqns, plan, engram_fq
         weight_scale = scale_name(fqn)
         if weight_scale in hf_state_dict:
             quantized_scales[weight_scale] = idx
-    quant_types = [quant_description_type(swap.weight_config) for swap, _ in plan]
+    # Only the applied plan entries describe the artifact: an entry whose filter matched
+    # no tensor (a recipe spec for a component the checkpoint does not carry) must not
+    # pick the model-wide label. ``group_size`` below uses the same set.
+    applied = set(quantized_fqns.values())
+    quant_types = {idx: quant_description_type(plan[idx][0].weight_config) for idx in applied}
     # Mixed exports keep the FP8 model label; each weight records its own format.
-    quant_type = "W4A8_MXFP" if set(quant_types) == {"W4A8_MXFP"} else "W8A8_MXFP8"
+    quant_type = "W4A8_MXFP" if set(quant_types.values()) == {"W4A8_MXFP"} else "W8A8_MXFP8"
     description: dict[str, object] = {
         "model_quant_type": quant_type,
         "version": "1.0.0",
@@ -113,9 +125,7 @@ def build_quant_model_description(hf_state_dict, quantized_fqns, plan, engram_fq
 
     # ``quant_description_type`` rejects every MX block size other than 32, so
     # this set has at most one element.
-    block_sizes = {
-        effective_weight_config(plan[idx][0].weight_config).block_size for idx in set(quantized_fqns.values())
-    }
+    block_sizes = {effective_weight_config(plan[idx][0].weight_config).block_size for idx in applied}
     if block_sizes:
         description["group_size"] = next(iter(block_sizes))
     return description
@@ -144,6 +154,8 @@ SAFETENSORS_DTYPES = {
     torch.float8_e5m2: "F8_E5M2",
     torch.float8_e8m0fnu: "F8_E8M0",
 }
+# Inverse view used when reading an HF asset header to restore native dtypes.
+NATIVE_DTYPES_BY_TAG = {tag: dtype for dtype, tag in SAFETENSORS_DTYPES.items()}
 
 # HF config ``model_type`` vLLM Ascend dispatches on, per model spec name.
 EXPECTED_CONFIG_MODEL_TYPE = {
@@ -185,9 +197,88 @@ def read_safetensors_header(path: Path) -> dict[str, dict]:
     return header
 
 
-def has_vision_tower(state_dict: dict[str, torch.Tensor]) -> bool:
-    """Whether the exported state contains a vision tower tensor."""
-    return any(fqn.startswith(VISION_TOWER_PREFIXES) for fqn in state_dict)
+_VISION_NAMESPACE_MARKERS = (
+    "vision",
+    "visual",
+    "aligner",
+    "image_encoder",
+    "image_model",
+    "vision_tower",
+    "vision_encoder",
+    "visual_merger",
+    "multimodal_projector",
+    "mm_projector",
+)
+
+
+def vision_prefixes_from_hf_assets(assets_path: Path) -> tuple[str, ...]:
+    """Discover vision tensor namespaces from an HF index or safetensors headers.
+
+    A model config can tell us that a vision tower exists, but it does not have a
+    portable contract for the checkpoint namespace.  The index/header is the
+    authoritative source for those names.  Existing prefixes remain the fallback
+    for releases without an index or with a model-specific marker-only layout.
+    """
+    names: set[str] = set()
+    index_path = assets_path / "model.safetensors.index.json"
+    if index_path.is_file():
+        try:
+            index = json.loads(index_path.read_text())
+            weight_map = index.get("weight_map", {})
+            if isinstance(weight_map, dict):
+                names.update(name for name in weight_map if isinstance(name, str))
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("cannot inspect HF safetensors index %s: %s", index_path, exc)
+    else:
+        for shard in sorted(assets_path.glob("*.safetensors")):
+            try:
+                names.update(read_safetensors_header(shard))
+            except (OSError, ValueError, TypeError) as exc:
+                logger.warning("cannot inspect HF safetensors header %s: %s", shard, exc)
+
+    prefixes = set(VISION_PREFIXES)
+    for name in names:
+        parts = name.split(".")
+        for end, part in enumerate(parts[:-1], 1):
+            normalized = part.lower().replace("-", "_")
+            if normalized in _VISION_NAMESPACE_MARKERS or any(
+                marker in normalized for marker in ("vision", "visual", "aligner")
+            ):
+                prefixes.add(".".join(parts[:end]) + ".")
+                break
+        if name in ("image_start", "image_end", "image_newline"):
+            prefixes.add(name)
+    discovered = tuple(sorted(prefixes))
+    if len(discovered) > len(VISION_PREFIXES):
+        logger.info("Discovered vision tensor prefixes from HF assets: %s", discovered)
+    return discovered
+
+
+# Marker vectors are not a tower: a checkpoint carrying only these is incomplete.
+_VISION_MARKER_PREFIXES = (*VISION_MARKER_NAMES, IMAGE_MARKER_PREFIX)
+
+
+def has_vision_tower(state_dict: dict[str, torch.Tensor], prefixes: tuple[str, ...] | None = None) -> bool:
+    """Whether the exported state contains a vision tower tensor.
+
+    ``prefixes`` may be the wider ``VISION_PREFIXES`` set (exclusion/restore), but the
+    marker entries are always dropped here: a checkpoint carrying only the marker
+    vectors is not a complete tower, so it must not flip the ``config.json`` switch.
+    """
+    prefixes = prefixes or VISION_TOWER_PREFIXES
+    tower_prefixes = tuple(prefix for prefix in prefixes if prefix not in _VISION_MARKER_PREFIXES)
+    return any(fqn.startswith(tower_prefixes) for fqn in state_dict)
+
+
+def _vision_config_state(config: dict, model_name: str) -> tuple[str, bool] | None:
+    """Return the config field and enabled state used by a model's vision path."""
+    if model_name in ("deepseek_v4", "deepseek_v4_1"):
+        return "vision_n_layers", (config.get("vision_n_layers") or 0) > 0
+    if model_name == "qwen3_5":
+        # Any truthy value declares vision, so a text-only export is rejected even
+        # when the value is malformed; the value's shape is not otherwise validated.
+        return "vision_config", bool(config.get("vision_config"))
+    return None
 
 
 def sync_vision_config(output_dir: Path, *, model_name: str, export_has_vision: bool) -> None:
@@ -202,8 +293,11 @@ def sync_vision_config(output_dir: Path, *, model_name: str, export_has_vision: 
     if not config_path.is_file():
         return
     config = json.loads(config_path.read_text())
-    if model_name in ("deepseek_v4", "deepseek_v4_1"):
-        config_has_vision = (config.get("vision_n_layers") or 0) > 0
+    field_state = _vision_config_state(config, model_name)
+    if field_state is None:
+        return
+    field, config_has_vision = field_state
+    if field == "vision_n_layers":
         if not export_has_vision and config_has_vision:
             config["vision_n_layers"] = 0
             config_path.write_text(json.dumps(config, indent=2) + "\n")
@@ -214,8 +308,7 @@ def sync_vision_config(output_dir: Path, *, model_name: str, export_has_vision: 
                 "vLLM Ascend skips them during text-only serving"
             )
         return
-    if model_name == "qwen3_5":
-        config_has_vision = isinstance(config.get("vision_config"), dict) and bool(config["vision_config"])
+    if field == "vision_config":
         if not export_has_vision and config_has_vision:
             raise ValueError(
                 "the export has no vision weights, but config.json declares vision_config; "
@@ -235,6 +328,7 @@ def _quantized_weight_problems(
     description: dict,
     *,
     keep_scale_tail_dim: bool,
+    input_sizes: dict[str, int] | None = None,
 ) -> list[str]:
     problems: list[str] = []
     for fqn, idx in sorted(quantized_fqns.items()):
@@ -249,7 +343,10 @@ def _quantized_weight_problems(
             problems.append(f"{fqn}: quantized weight must be 2D, got shape {tuple(qdata.shape)}")
             continue
         if effective_config.elem_dtype is torch.float4_e2m1fn_x2:
-            expected_dtype, input_size = torch.uint8, qdata.shape[-1] * 2
+            expected_dtype = torch.uint8
+            # The packed payload stores two 4-bit values per byte; use the master's
+            # quant dim when the caller recorded it, so an odd K is not rounded up.
+            input_size = (input_sizes or {}).get(fqn, qdata.shape[-1] * 2)
         else:
             expected_dtype, input_size = effective_config.elem_dtype, qdata.shape[-1]
         if qdata.dtype is not expected_dtype:
@@ -328,19 +425,6 @@ def _engram_problems(
                                 problems.append(
                                     f"{tensor_name}: index targets {target!r}, which does not contain the tensor"
                                 )
-        # vLLM Ascend probes the ModelSlim index name first; a stale one in the output
-        # directory would shadow the index this exporter just wrote.
-        modelslim_index = output_dir / "quant_model_weights.safetensors.index.json"
-        if modelslim_index.is_file():
-            modelslim_map = json.loads(modelslim_index.read_text()).get("weight_map", {})
-            shadowed = sorted(
-                name for fqn in engram_fqns for name in (fqn, engram_scale_name(fqn)) if name in modelslim_map
-            )
-            if shadowed:
-                problems.append(
-                    "quant_model_weights.safetensors.index.json shadows the exported index for Engram "
-                    f"tensor(s) {shadowed[:4]}; vLLM Ascend probes it first, so remove it from the output directory"
-                )
     return problems
 
 
@@ -351,6 +435,7 @@ def _model_contract_problems(
     model_name: str,
     needs_vision: bool,
     export_has_vision: bool,
+    vision_prefixes: tuple[str, ...] | None = None,
 ) -> list[str]:
     problems: list[str] = []
     if needs_vision and not export_has_vision:
@@ -363,7 +448,8 @@ def _model_contract_problems(
             "deepseek_v4 description lacks 'hc_head_fn'; vLLM Ascend only rewrites the "
             "checkpoint-named description keys when that key is present"
         )
-    if model_name == "deepseek_v4_1" and any(key.startswith(VISION_PREFIXES) for key in state_dict):
+    vision_prefixes = vision_prefixes or VISION_PREFIXES
+    if model_name == "deepseek_v4_1" and any(key.startswith(vision_prefixes) for key in state_dict):
         for marker in ("image_start", "image_end", "image_newline"):
             if marker not in state_dict:
                 problems.append(f"deepseek_v4_1 multimodal export is missing {marker!r}")
@@ -396,16 +482,18 @@ def _config_problems(output_dir: Path, *, model_name: str, export_has_vision: bo
         )
     if not config.get("architectures"):
         problems.append("config.json has no architectures")
-    if model_name in ("deepseek_v4", "deepseek_v4_1"):
-        if not export_has_vision and (config.get("vision_n_layers") or 0) > 0:
+    field_state = _vision_config_state(config, model_name)
+    if field_state is not None:
+        field, config_has_vision = field_state
+        if not export_has_vision and config_has_vision and field == "vision_n_layers":
             problems.append(
                 "config.json declares vision_n_layers>0, but the export contains no vision weights; it must be set to 0"
             )
-    elif model_name == "qwen3_5" and not export_has_vision and config.get("vision_config"):
-        problems.append(
-            "config.json declares vision_config, but the export contains no vision weights; "
-            "provide a text-only Qwen config"
-        )
+        elif not export_has_vision and config_has_vision and field == "vision_config":
+            problems.append(
+                "config.json declares vision_config, but the export contains no vision weights; "
+                "provide a text-only Qwen config"
+            )
     quant_config = config.get("quantization_config")
     if not isinstance(quant_config, dict) and isinstance(config.get("text_config"), dict):
         quant_config = config["text_config"].get("quantization_config")
@@ -494,6 +582,8 @@ def validate_export(
     model_name: str,
     keep_scale_tail_dim: bool,
     needs_vision: bool,
+    vision_prefixes: tuple[str, ...] | None = None,
+    input_sizes: dict[str, int] | None = None,
 ) -> None:
     """Fail unless the written directory matches the vLLM Ascend export contract.
 
@@ -508,6 +598,9 @@ def validate_export(
     ``quant_model_description.json`` written to disk, the shard tensor set, the
     vision tower and per-MoE vision bias the export requires, and the
     ``config.json`` vLLM dispatches on.
+
+    ``input_sizes`` (``fqn -> K`` of the master weight) keeps the FP4 scale check on
+    the real quant dim; without it the packed payload's last dim is doubled.
     """
     model_name = normalize_model_name(model_name)
     if keep_scale_tail_dim:
@@ -515,11 +608,16 @@ def validate_export(
             "keep_scale_tail_dim preserves the packed (..., ceil(blocks / 2), 2) weight_scale "
             "layout; the exported checkpoint is for inspection and is not directly loadable by vLLM Ascend"
         )
-    export_has_vision = has_vision_tower(state_dict)
+    export_has_vision = has_vision_tower(state_dict, vision_prefixes)
     shard_problems, written = _shard_problems(output_dir, shard_names, state_dict)
     problems = [
         *_quantized_weight_problems(
-            state_dict, quantized_fqns, plan, description, keep_scale_tail_dim=keep_scale_tail_dim
+            state_dict,
+            quantized_fqns,
+            plan,
+            description,
+            keep_scale_tail_dim=keep_scale_tail_dim,
+            input_sizes=input_sizes,
         ),
         *_engram_problems(output_dir, shard_names, state_dict, description),
         *_model_contract_problems(
@@ -528,6 +626,7 @@ def validate_export(
             model_name=model_name,
             needs_vision=needs_vision,
             export_has_vision=export_has_vision,
+            vision_prefixes=vision_prefixes,
         ),
         *_config_problems(output_dir, model_name=model_name, export_has_vision=export_has_vision),
         *_description_problems(output_dir, state_dict, description, written),
@@ -536,8 +635,6 @@ def validate_export(
     if problems:
         raise ValueError("exported checkpoint is not directly loadable by vLLM Ascend:\n  " + "\n  ".join(problems))
     logger.info(
-        "Validated %d quantized tensor(s), %d shard(s), the description, and config.json%s",
-        len(quantized_fqns),
-        len(shard_names),
+        "Validated quantized weights, scale geometry, the description, and config.json%s",
         " (packed inspection scale layout; not vLLM-loadable)" if keep_scale_tail_dim else "",
     )
