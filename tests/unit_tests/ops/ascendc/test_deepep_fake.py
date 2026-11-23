@@ -295,7 +295,9 @@ def test_mxfp8_deepep_dispatch_seam_quantizes_payload(monkeypatch, mxfp8_deepep_
     x = torch.randn(2, 3)
     topk_idx = torch.tensor([[0, 1], [0, 1]], dtype=torch.int32)
     topk_scores = torch.tensor([[0.2, 0.8], [0.3, 0.7]])
-    routed, scores, counts, received_handle = dispatcher._dispatch_activation_exchange(x, topk_idx, topk_scores)
+    routed, scores, counts, received_handle = dispatcher._dispatch_activation_exchange(
+        x, topk_idx, topk_scores, num_experts=dispatcher.num_experts
+    )
 
     _, payload, received_idx, received_scores, args = calls[0]
     assert len(payload) == 2 and payload[0] is qdata and payload[1] is scale
