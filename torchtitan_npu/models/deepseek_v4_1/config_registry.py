@@ -263,11 +263,10 @@ def _make_trainer_config(
     vision = isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config)
 
     config = DeepSeekV41Trainer.Config(
-        # One packed row per rank, which is what the model asserts and the loaders
-        # produce: documents are packed into a single row and the row is cut at
-        # ``seq_len``.  Upstream's default is 8, so the recipe states it rather than
-        # inheriting it -- a launcher that wants a different value still overrides the
-        # flag, and the model rejects it.
+        # Each row is an independently packed sequence of up to ``seq_len`` tokens;
+        # ``local_batch_size`` is the number of such rows this rank holds.  The
+        # CPT launcher may raise the default on CP1 with fused, non-quantized
+        # sparse attention and indexer, with a matching ``global_batch_size``.
         training=TrainingConfig(local_batch_size=1),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(

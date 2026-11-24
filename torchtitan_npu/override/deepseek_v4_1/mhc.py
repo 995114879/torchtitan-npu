@@ -86,11 +86,8 @@ class AscV41HcPost(HcPost):
         pass
 
     def forward(self, y_BLD, residual_BLHcD, post_BLHc, comb_BLHcHc):
-        # Sequence-parallel linears hand the collapsed stream back batch-folded
-        # (``[T, D]`` with B=1); the reference arithmetic broadcasts that
-        # silently, but the kernel requires the explicit ``[B, T, D]`` form.
         if y_BLD.ndim == 2:
-            y_BLD = y_BLD.unsqueeze(0)
+            y_BLD = y_BLD.reshape(residual_BLHcD.shape[0], residual_BLHcD.shape[1], -1)
         return torch.ops.cann_ops_transformer.mhc_post(residual_BLHcD, comb_BLHcHc, y_BLD, post_BLHc)
 
 

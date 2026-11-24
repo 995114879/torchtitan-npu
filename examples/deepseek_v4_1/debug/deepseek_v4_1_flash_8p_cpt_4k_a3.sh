@@ -38,7 +38,7 @@ SPMD_BACKEND="spmd_types"
 # Training
 # Retain the validated eager / Muon / FullAC resource crop.
 SEQ_LEN=4096
-MBS=1
+MBS="${MBS:-1}"
 GBS="${GBS:-64}"
 STEPS=40
 

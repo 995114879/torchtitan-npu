@@ -58,7 +58,6 @@ NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.
                       xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
 NGPU="${NGPU:-8}"
 export NODE_IPS NGPU
-export MBS="${MBS:-1}"
 
 # A5 defaults to block-FP8 quantized training.
 # The FP8 pre-quantize guard needs both local-shard dims to be 64-aligned, and
@@ -75,7 +74,10 @@ QUANTIZATION_ARGS=(
     --extension.quantization.fsdp-prequantize-fqns .attention.wq_b,.attention.wo_a
 )
 
-# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
+# disable swap optimizer for better performance
+export OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-}"
+
+# To check performance, append --debug.moe-force-load-balance and --training.local-batch-size 2.
 exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_cpt_4k_a3.sh" \
     "${QUANTIZATION_ARGS[@]}" \
     "$@"

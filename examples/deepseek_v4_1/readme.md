@@ -40,7 +40,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --training.steps 3 --lr-scheduler.total-steps 3 --lr-scheduler.warmup-steps 2
 ```
 
-单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家（`CONFIG` 取该多模态配方的 `*_deepep` 变体）；均使用 seq4096（4k）、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。两个 8P debug 入口共用 A3 脚本的默认 local/global batch 1/64（`GBS=64`，可用环境变量或末尾 CLI 覆盖）；qat/sft 派生入口同样继承该默认值，需要保持 1/8 时显式设置 `GBS=8`。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
+单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家（`CONFIG` 取该多模态配方的 `*_deepep` 变体）；均使用 seq4096（4k）、FSDP8/EP8、Muon（NS steps=10）、eager、FullAC，训练与调度均为 40 步。8P CPT debug 默认 local/global batch 为 A3 `1/64`、A5 `2/64`。Golden、SFT 和量化 sparse attention / QLI 的 QAT 入口默认 `1/64`。CPT 多行 batch 要求 CP1，并同时开启非量化的 fused sparse attention 与 lightning indexer。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
 
 关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机使用 `--training.seq-len 2048`，脚本保留 4k 默认配置。A3 与 A5 8P 入口的默认 swap 行为不同：A5 包装层把未设置的 `OPTIMIZER_OVERRIDES` 归一为空，默认不启用 swap override（优化器状态常驻 NPU）；调用方显式设置该变量时仍会生效，也可在末尾用 `--override.imports` 传入包含 `swap_optimizer` 的完整列表重新启用。A3 8P 入口与 A5 多机入口仍默认保留 swap override。
 
@@ -71,7 +71,7 @@ A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、MBS1/GBS1024、100 步、M
 
 两个 A5 CPT 入口（本多机入口与 `debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh`）在上述量化配置之外还默认启用 FSDP 权重预量化（`--extension.quantization.enable-fsdp-prequantize`），白名单由 `--extension.quantization.fsdp-prequantize-fqns` 指定并随 FSDP 切分度收窄：多机入口在 FSDP128 下只保留分片后仍满足 64 对齐的 `wq_b`、`wo_a`；8P debug 入口在 FSDP8 下可多收录 `wkv`、`wo_b`、`indexer.wq_b`、`shared_experts.w2` 与 `engram.gate.wkv`（后者 dim0=25600，FSDP8 下每卡 3200 行满足对齐，FSDP128 下缩为 200 行，因此多机入口不收录）。两个入口都不收录 routed experts——EP 占满全部 FSDP 切分卡（多机 EP128=DP_SHARD128，8P EP8=DP_SHARD8），专家 FSDP mesh（efsdp）尺寸为 1，白名单命中只会在 post-all-gather 提前量化、抬高峰值显存而无通信收益。`wq_a` 与 `shared_experts.w1`/`w3` 在两个切分度下都不满足对齐，因此均不在白名单内。对齐约束与报错行为详见 [低精度训练指南](../../docs/feature_guides/low_precision_training.md)。
 
-`NGPU`、`EP`、`DP_SHARD`、`GBS`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家；MBS 必须为 1。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。覆盖 `DP_SHARD` 或 `CONFIG` 后脚本白名单不会自动调整：权重按 `Shard(0)` 均分，切分度变化会让原本对齐的分片不再满足 64 对齐；换用 `deepseek_v4_1_debugmodel_multimodal` 等窄宽度 `CONFIG` 同样会破坏对齐（DP_SHARD=8 下 `wkv` 本地分片缩为 8 行、`indexer.wq_b` 缩为 32 行），两种情况训练启动即报错（报错信息只含本地分片形状，可对照低精度训练指南的判定式定位权重），此时从末尾追加的 `--extension.quantization.fsdp-prequantize-fqns` 中移除该权重（多个模式写在同一参数内并以英文逗号分隔）、追加 `--extension.quantization.no-enable-fsdp-prequantize` 关闭预量化，或改回默认 `DP_SHARD`/`CONFIG`。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
+`NGPU`、`EP`、`DP_SHARD`、`GBS`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家；MBS 默认 1，满足上述 CPT 多行条件时可通过 `MBS` 调大。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。覆盖 `DP_SHARD` 或 `CONFIG` 后脚本白名单不会自动调整：权重按 `Shard(0)` 均分，切分度变化会让原本对齐的分片不再满足 64 对齐；换用 `deepseek_v4_1_debugmodel_multimodal` 等窄宽度 `CONFIG` 同样会破坏对齐（DP_SHARD=8 下 `wkv` 本地分片缩为 8 行、`indexer.wq_b` 缩为 32 行），两种情况训练启动即报错（报错信息只含本地分片形状，可对照低精度训练指南的判定式定位权重），此时从末尾追加的 `--extension.quantization.fsdp-prequantize-fqns` 中移除该权重（多个模式写在同一参数内并以英文逗号分隔）、追加 `--extension.quantization.no-enable-fsdp-prequantize` 关闭预量化，或改回默认 `DP_SHARD`/`CONFIG`。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
 
 初始权重不会因设置 `HF_ASSETS_PATH` 自动加载：需要时设置 `CKPT_INIT_LOAD_PATH` 指向 HF checkpoint；保存 checkpoint 另加 `--checkpoint.no-load-only`。默认不启用参数/梯度 CPU offload，保留 `swap_optimizer` 对 Engram 的适配。`USE_GOLDEN=1` 切换 reference override；A5 若还要关闭量化，追加 `--extension.quantization.no-enable-quantized-training`。
 
@@ -100,7 +100,7 @@ V4.1 主线现已覆盖官方 MXFP8 整包的读取路径：Engram 表及 gate �
 
 直接复用上游 `HuggingFaceMultiModalDataset` 的 DP 分片、`MMSamplePacker` 和状态恢复，以及 `ParallelAwareDataloader`。针对 TorchTitan 0.3.0 的 HF 恢复起点跨 epoch 重放问题，按上游文本 loader 的方式补齐 `set_epoch`；packing 缓冲满时调用上游 `flush()`。DSV4.1 只适配协议层：`BOS + 完整图片协议 + caption + EOS`；只有 caption 与 EOS 参与监督，图片特征索引按 pack 中的图片顺序连续编号，每篇文档的位置从零开始。每篇文档按 dataloader 的 `per_doc_alignment`（recipe 由模型压缩比取 LCM 得到，当前为 2）在 EOS 后补至整数个池化组：pad 的 label 为 `-100`，位置继续累加，因此它留在本文档内、既不被监督也不改变下一篇文档的起点。注意 pad 会顶掉奇数长度文档 EOS 的目标（label 在文档内右移，EOS 的下一个位置变成了 pad，而 pad 的 label 是 `-100`），即每篇奇数长度文档少一个监督目标；对齐不覆盖行切分，长于 `seq_len` 的文档仍按行切开，续行另起一套池化组。
 
-与上游一致，`--dataloader.packing-buffer-size 0` 默认关闭 packing；设置正值（例如 `128`）启用。一个 rank 的 local batch 仍为 1，但一个 packed 序列可以包含多篇图文样本。装箱和合并仍调用上游实现；缓冲量还包括待输出的 packed 队列及 loader 预取，不是进程内存的硬上限。
+与上游一致，`--dataloader.packing-buffer-size 0` 默认关闭 packing；设置正值（例如 `128`）启用。每个 rank 一次读取 `local_batch_size` 行，每行独立装入一篇或多篇图文样本。装箱和合并仍调用上游实现；缓冲量还包括待输出的 packed 队列及 loader 预取，不是进程内存的硬上限。
 
 A/B 必须固定 tar 内容及顺序、tokenizer、序列长度、packing buffer、DP/全局 batch、seed 和初始权重。旧模型结构的 manifest/合成轨迹与新入口、新 LI 训练目标的轨迹互不可比；迁移后的对照统一使用新 reference 起点或同一份完整 checkpoint。精确续训使用完整 checkpoint 恢复 loader 状态；model-only 加载只复用权重（新旧结构需按参数名对账后映射，不做静默兼容）。
 
@@ -124,7 +124,7 @@ SFT 复用同目录的 CPT launcher，只替换 dataloader；不另设 checkpoin
 
 图片相对路径默认以数据文件所在目录为根；也可以通过 override 的 `image_root` 指定统一根目录。普通 HTTP(S) URL 不在训练 worker 中下载，需先落盘；data URI 可以直接使用。无图片的纯文本样本沿用同一官方 chat encoding。
 
-默认 `chat` 模式对每个 assistant 回复计算监督，system/user/image/padding label 均为 `-100`，assistant 回复及 EOS 参与 loss。超过 `training.seq_len` 的样本被跳过。与 CPT 一样，每个数据并行 rank 处理一条序列（`training.local_batch_size=1`）；这不限制节点数，global batch 由有效 DP 度和梯度累积扩展。`dataloader.num_workers` 等 worker 配置与 tensor batch 独立并正常透传，DP shard 和恢复状态沿用公共 V4.1 数据生命周期。
+默认 `chat` 模式对每个 assistant 回复计算监督，system/user/image/padding label 均为 `-100`，assistant 回复及 EOS 参与 loss。超过 `training.seq_len` 的样本被跳过。SFT 的每个数据并行 rank 处理一条序列（`training.local_batch_size=1`）；这不限制节点数，global batch 由有效 DP 度和梯度累积扩展。`dataloader.num_workers` 等 worker 配置与 tensor batch 独立并正常透传，DP shard 和恢复状态沿用公共 V4.1 数据生命周期。
 
 ```sh
 DATASET_PATH=/path/to/vqa.jsonl \

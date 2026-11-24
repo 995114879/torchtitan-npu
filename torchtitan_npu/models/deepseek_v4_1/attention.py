@@ -346,7 +346,7 @@ class Attention(BaseAttention):
         # The output projection is grouped: wo_a projects each query-head group on its
         # own, wo_b mixes the per-group results back to the model dimension.  The group
         # count comes from the module so a group-wise sharding can narrow it later.
-        o = self.wo_a(o.reshape(bsz * seqlen, self.wo_a.n_batches, -1))
+        o = self.wo_a(o.reshape(bsz, seqlen, self.wo_a.n_batches, -1))
         o = self.wo_b(o.flatten(-2))
         # The rows stay this rank's chunks: the window the layer was handed is the window the
         # layer above is handed, so nothing is un-permuted on the way out.

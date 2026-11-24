@@ -28,14 +28,14 @@ def tokenizer():
     return HuggingFaceTokenizer(tokenizer_path=str(ASSETS / "deepseek_v3"))
 
 
-def _loader(tokenizer, *, rank=0, world=1, packing=0, infinite=False, alignment=2):
+def _loader(tokenizer, *, rank=0, world=1, packing=0, infinite=False, alignment=2, batch_size=1):
     return DeepSeekV41DataLoader.Config(
         dataset="cc12m-test",
         dataset_path=str(ASSETS / "cc12m_test"),
         packing_buffer_size=packing,
         infinite=infinite,
         per_doc_alignment=alignment,
-    ).build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=world, seq_len=512, local_batch_size=1)
+    ).build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=world, seq_len=512, local_batch_size=batch_size)
 
 
 def _captions(loader):
@@ -71,14 +71,33 @@ def test_packed_images_supervision_and_positions(tokenizer):
     assert sorted(actual_captions) == sorted(unpacked)
 
 
-@pytest.mark.parametrize("consumed", [1, 33])
-def test_packed_loader_resume_pending_samples(tokenizer, consumed):
-    original = _loader(tokenizer, packing=8, infinite=True)
+def test_multi_row_batch_keeps_rows_independent(tokenizer):
+    inputs, labels = next(iter(_loader(tokenizer, batch_size=2)))
+    assert inputs["input"].shape == (2, 512)
+    assert inputs["positions"].shape == (2, 512)
+    assert inputs["token_types"].shape == (2, 512)
+    assert inputs["image_feature_indices"].shape == (2, 512)
+    assert labels.shape == (2, 512)
+    for row in range(2):
+        assert (inputs["token_types"][row] == IMAGE_START).sum() == (inputs["token_types"][row] == IMAGE_END).sum()
+        assert (labels[row] != -100).any()
+        # Each row keeps its own shifted targets, so a row boundary is never
+        # supervised as an ``EOS -> BOS`` transition.
+        assert labels[row, -1] == -100
+    indices = inputs["image_feature_indices"]
+    flat = indices[indices >= 0]
+    assert torch.equal(flat, torch.arange(flat.numel()))
+
+
+@pytest.mark.parametrize("consumed,batch_size,world,alignment", [(1, 1, 1, 2), (33, 1, 1, 2), (6, 2, 3, 512)])
+def test_packed_loader_resume_pending_samples(tokenizer, consumed, batch_size, world, alignment):
+    options = dict(packing=8, infinite=True, batch_size=batch_size, world=world, alignment=alignment)
+    original = _loader(tokenizer, **options)
     iterator = iter(original)
     for _ in range(consumed):
         next(iterator)
     state = deepcopy(original.state_dict())
-    restored = _loader(tokenizer, packing=8, infinite=True)
+    restored = _loader(tokenizer, **options)
     restored.load_state_dict(state)
     resumed = iter(restored)
     # Restore buffered packs both in the first epoch and after all 32 source samples.

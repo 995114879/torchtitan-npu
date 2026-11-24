@@ -83,5 +83,6 @@ def test_context_parallel_refuses_a_batched_row(monkeypatch, model):
     config.parallelism.context_parallel_degree = 2
     config.parallelism.context_parallel_load_balancer = "doc_chunk"
     config.training.local_batch_size = 2
-    with pytest.raises(ValueError, match="one packed row per rank"):
+    match = "one packed row per rank" if model == "v4" else "local_batch_size=1 when context parallelism"
+    with pytest.raises(ValueError, match=match):
         config.model_spec.model.update_from_config(config=config)

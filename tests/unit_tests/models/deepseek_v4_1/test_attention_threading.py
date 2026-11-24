@@ -67,6 +67,22 @@ def _tiny_debug_model(monkeypatch):
     return model, config
 
 
+def test_attention_projection_preserves_rows_for_reference_hc_post(monkeypatch):
+    model, config = _tiny_debug_model(monkeypatch)
+    layer = model.layers["0"]
+    _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
+    metadata = layer_metadata(layer, kwargs)
+    monkeypatch.setattr(layer.attention.inner_attention, "forward", lambda query, *args, **kwargs: query)
+    hidden = torch.randn(2, _TOKENS.shape[1], config.dim, generator=torch.Generator().manual_seed(42))
+    projected = layer.attention(hidden, _POSITIONS.expand(2, -1), metadata)[0]
+    expected = torch.cat([layer.attention(row.unsqueeze(0), _POSITIONS, metadata)[0] for row in hidden])
+    residual = torch.zeros(*hidden.shape[:2], 4, config.dim)
+    post = torch.ones_like(residual[..., 0])
+    comb = post.unsqueeze(-1).expand(-1, -1, -1, 4)
+    actual = layer.hc_post(projected, residual, post, comb)
+    torch.testing.assert_close(actual, expected.unsqueeze(-2).expand_as(residual))
+
+
 def _record_module_forwards(model):
     """Record each block's incoming/outgoing thread and the sparse core's inputs."""
     blocks_in, blocks_out, cores_in, handles = {}, {}, {}, []

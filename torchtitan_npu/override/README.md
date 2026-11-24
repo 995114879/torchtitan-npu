@@ -277,8 +277,8 @@ Checkpoint manager 的 NPU 替换与文件级 SHA-256 manifest 校验不再是 o
 `rope.asc_half_rotation` 精确匹配 `HalfRotation.Config`，与上述 rope 入口分属不同
 target，可以在同一 recipe 中并用（V4.1 A3 脚本即视觉 `asc_half_rotation` + 文本
 `asc_complex`）。
-`AscComplexRoPE` 和 `AscCosSinRoPE` 当前都要求同一 batch 内各行的位置布局一致，
-并使用第一行位置构造 batch 共享的 cosine/sine 表。
+`AscComplexRoPE` 保留逐行 positions，并在位置表携带独立 batch 行时将 batch 折入 sequence 轴后调用融合算子。
+`AscCosSinRoPE` 当前要求同一 batch 内各行的位置布局一致，并使用第一行位置构造 batch 共享的 cosine/sine 表。
 
 `token_dispatcher.asc` / `token_dispatcher.asc_deepep` 不能同时启用；DeepEP 路径的 dispatch/combine见[DeepEP 特性说明](../../docs/feature_guides/deepep.md)。
 

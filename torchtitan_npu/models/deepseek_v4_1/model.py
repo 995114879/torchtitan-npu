@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 from torch import nn
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.rope import RoPE
 
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 
@@ -282,16 +283,6 @@ class DeepSeekV41Model(Decoder):
 
         def update_from_config(self, *, config, **kwargs):
             parallelism = config.parallelism
-            if config.training.local_batch_size != 1:
-                # V4.1 packs one row per rank: the document boundaries, the compressor's
-                # group grid and the fused kernels' ragged layout are all defined on that
-                # single row.  The model relies on it, so it is checked here rather than
-                # left to each launcher — and it covers context parallelism a fortiori,
-                # since CP addresses the same packed row.
-                raise ValueError(
-                    "DeepSeek V4.1 requires one packed row per rank "
-                    f"(training.local_batch_size=1), got {config.training.local_batch_size}"
-                )
             if parallelism.tensor_parallel_degree != 1:
                 raise NotImplementedError("DeepSeek V4.1 currently supports TP=1 only")
             pp = parallelism.pipeline_parallel_degree
@@ -302,6 +293,7 @@ class DeepSeekV41Model(Decoder):
             # traceable gather_attn reference implementation.
             fused_core, fused_selector = _requested_fused_attention(config.override)
             _check_indexer_teacher_pair(fused_core, fused_selector)
+            self._check_batch_size_contract(config, parallelism, fused_core)
             self._check_context_parallel(parallelism.context_parallel_degree, fused_core, fused_selector)
             Decoder.Config.update_from_config(self, config=config, **kwargs)
 
@@ -310,13 +302,54 @@ class DeepSeekV41Model(Decoder):
                     f"compress_ratios must match n_layers ({self.n_layers}), got {len(self.compress_ratios)}"
                 )
 
-            if hasattr(config, "training"):
-                from torchtitan.models.common.rope import RoPE
+            self._update_rope_lengths(config)
+            self._validate_engram_configs(config, parallelism)
 
-                seq_len = config.training.seq_len
-                for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
-                    setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
+            from .sharding import set_deepseek_v4_1_sharding_config
 
+            set_deepseek_v4_1_sharding_config(
+                self,
+                enable_sp=parallelism.enable_sequence_parallel,
+                enable_ep=parallelism.expert_parallel_degree > 1,
+            )
+            if parallelism.context_parallel_degree > 1:
+                from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelConverter
+
+                ContextParallelConverter.Config().build().convert(self)
+
+        def _check_batch_size_contract(self, config, parallelism, fused_core) -> None:
+            if parallelism.context_parallel_degree > 1 and config.training.local_batch_size != 1:
+                raise ValueError(
+                    "DeepSeek V4.1 requires local_batch_size=1 when context parallelism is enabled; "
+                    f"got CP={parallelism.context_parallel_degree}, "
+                    f"local_batch_size={config.training.local_batch_size}"
+                )
+            if config.training.local_batch_size > 1:
+                quant = config.extension.quantization
+                if quant.enable_quantized_training and (
+                    quant.enable_sparse_attention_quantization or quant.li_quantization
+                ):
+                    raise ValueError("V4.1 quantized sparse attention and QLI/QSLI require local_batch_size=1")
+            if config.training.local_batch_size > 1 and not fused_core:
+                # The reference core hands attn-gym packed offsets for a batch-one row, and
+                # its selector's distillation pass squeezes the batch axis.  Multi-row
+                # batches are therefore only defined on the fused stack, which flattens the
+                # rows into one TND frame.
+                raise NotImplementedError(
+                    "DeepSeek V4.1 supports local_batch_size>1 on the fused attention only: "
+                    "request override.deepseek_v4_1.sparse_attn.asc and "
+                    "override.deepseek_v4_1.lightning_indexer.asc, or set "
+                    "training.local_batch_size=1."
+                )
+
+        def _update_rope_lengths(self, config) -> None:
+            if not hasattr(config, "training"):
+                return
+            seq_len = config.training.seq_len
+            for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
+                setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
+
+        def _validate_engram_configs(self, config, parallelism) -> None:
             engram_configs = [layer.engram for layer in self.layers if layer.engram is not None]
             ep_degree = max(1, parallelism.expert_parallel_degree)
             for engram_cfg in engram_configs:
@@ -331,10 +364,7 @@ class DeepSeekV41Model(Decoder):
                             "Engram tokenizer compression is required, but neither "
                             "table.token_id_map_path nor hf_assets_path is configured."
                         )
-                    table_cfg.tokenizer_path = os.path.join(
-                        config.hf_assets_path,
-                        "tokenizer.json",
-                    )
+                    table_cfg.tokenizer_path = os.path.join(config.hf_assets_path, "tokenizer.json")
                 if table_cfg.num_embeddings % ep_degree != 0:
                     raise ValueError(
                         f"Engram physical table size ({table_cfg.num_embeddings}) must "
@@ -342,18 +372,6 @@ class DeepSeekV41Model(Decoder):
                         "EngramArgs.table_padding_multiple without changing it "
                         "between checkpoints."
                     )
-
-            from .sharding import set_deepseek_v4_1_sharding_config
-
-            set_deepseek_v4_1_sharding_config(
-                self,
-                enable_sp=parallelism.enable_sequence_parallel,
-                enable_ep=parallelism.expert_parallel_degree > 1,
-            )
-            if parallelism.context_parallel_degree > 1:
-                from torchtitan_npu.models.deepseek_v4.context_parallel import ContextParallelConverter
-
-                ContextParallelConverter.Config().build().convert(self)
 
         def _check_context_parallel(self, context_parallel_degree: int, fused_core: bool, fused_selector: bool) -> None:
             """Reject a CP degree this stack cannot run.

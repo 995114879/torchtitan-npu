@@ -86,9 +86,7 @@ class _V41Collator:
     seq_len: int
     vocab_size: int
 
-    def __call__(self, batch):
-        # The current model uses one document-packed stream per DP rank.
-        (sample,) = batch
+    def _row(self, sample):
         ids, labels, positions = (sample[k] for k in ("input_ids", "labels", "positions"))
         images = sample["pixel_values"]
         starts = (positions == 0).nonzero().flatten().tolist()
@@ -111,14 +109,34 @@ class _V41Collator:
         # EOS -> the next document's BOS. Padding is a separate document.
         targets = torch.nn.functional.pad(labels[1:], (0, pad + 1), value=-100)
         positions = torch.cat((positions, torch.arange(pad)))
+        return tokens, positions, token_types, feature_indices, targets, images, feature_base
+
+    def __call__(self, batch):
+        rows = [self._row(sample) for sample in batch]
+        offsets = []
+        total_features = 0
+        for row in rows:
+            offsets.append(total_features)
+            total_features += row[6]
+        tokens, positions, token_types, feature_indices, targets = [], [], [], [], []
+        all_images = []
+        for offset, (row_tokens, row_positions, row_types, row_indices, row_targets, images, _) in zip(
+            offsets, rows, strict=True
+        ):
+            tokens.append(row_tokens)
+            positions.append(row_positions)
+            token_types.append(row_types)
+            feature_indices.append(torch.where(row_indices >= 0, row_indices + offset, row_indices))
+            targets.append(row_targets)
+            all_images.extend(images)
         return {
-            "input": tokens.unsqueeze(0),
-            "positions": positions.unsqueeze(0),
-            "token_types": token_types.unsqueeze(0),
-            "image_feature_indices": feature_indices.unsqueeze(0),
-            "pixel_values": pad_sequence([p for p, _ in images], batch_first=True),
-            "image_grid": torch.stack([g for _, g in images]),
-        }, targets.unsqueeze(0)
+            "input": torch.stack(tokens),
+            "positions": torch.stack(positions),
+            "token_types": torch.stack(token_types),
+            "image_feature_indices": torch.stack(feature_indices),
+            "pixel_values": pad_sequence([p for p, _ in all_images], batch_first=True),
+            "image_grid": torch.stack([g for _, g in all_images]),
+        }, torch.stack(targets)
 
 
 class DeepSeekV41DataLoader(ParallelAwareDataloader):
@@ -133,25 +151,7 @@ class DeepSeekV41DataLoader(ParallelAwareDataloader):
         """Per-document pooling granularity (the model's compression alignment);
         the recipe derives it from the model spec."""
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        tokenizer,
-        dp_world_size: int,
-        dp_rank: int,
-        seq_len: int,
-        local_batch_size: int,
-        **kwargs,
-    ):
-        if local_batch_size != 1:
-            raise ValueError("DSV4.1 expects one packed sequence per rank (local_batch_size=1)")
-        if config.per_doc_alignment < 1:
-            raise ValueError("per_doc_alignment must be positive")
-        if seq_len % config.per_doc_alignment:
-            raise ValueError(
-                f"seq_len ({seq_len}) must be a multiple of per_doc_alignment ({config.per_doc_alignment})"
-            )
+    def _build_dataset(self, config, tokenizer, *, dp_world_size, dp_rank, seq_len, local_batch_size):
         processor = ImagePatchProcessor()
         dataset = _MultiModalDataset(
             dataset_name=config.dataset,
@@ -179,8 +179,35 @@ class DeepSeekV41DataLoader(ParallelAwareDataloader):
         dataset.sample_processor = functools.partial(_process_mm_sample, per_doc_alignment=config.per_doc_alignment)
         if dataset.enable_packing:
             dataset.packer = _BufferedSamplePacker(
-                max_seq_length=seq_len, buffer_size=config.packing_buffer_size, batch_size=local_batch_size
+                max_seq_length=seq_len, buffer_size=config.packing_buffer_size, batch_size=1
             )
+        return dataset
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        tokenizer,
+        dp_world_size: int,
+        dp_rank: int,
+        seq_len: int,
+        local_batch_size: int,
+        **kwargs,
+    ):
+        if config.per_doc_alignment < 1:
+            raise ValueError("per_doc_alignment must be positive")
+        if seq_len % config.per_doc_alignment:
+            raise ValueError(
+                f"seq_len ({seq_len}) must be a multiple of per_doc_alignment ({config.per_doc_alignment})"
+            )
+        dataset = self._build_dataset(
+            config,
+            tokenizer,
+            dp_world_size=dp_world_size,
+            dp_rank=dp_rank,
+            seq_len=seq_len,
+            local_batch_size=local_batch_size,
+        )
         super().__init__(
             dataset,
             dp_rank=dp_rank,

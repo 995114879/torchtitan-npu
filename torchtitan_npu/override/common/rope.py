@@ -176,10 +176,7 @@ class _FirstRowPositionsMixin:
         )
 
 
-class AscComplexRoPE(
-    _FirstRowPositionsMixin,
-    WorkaroundComplexRoPE,
-):
+class AscComplexRoPE(WorkaroundComplexRoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(WorkaroundComplexRoPE.Config):
         pass
@@ -197,12 +194,10 @@ class AscComplexRoPE(
         sin = sin.to(query.dtype)
         if inverse:
             sin = -sin
-        xq_out = torch_npu.npu_rotary_mul(query.float(), cos, sin, rotary_mode="interleave").type_as(query)
+        xq_out = _npu_rotary_mul_shared_axis(query, cos, sin, "interleave").type_as(query)
         if key is None:
             return xq_out
-        xk_out = torch_npu.npu_rotary_mul(
-            key.float(), cos.to(key.dtype), sin.to(key.dtype), rotary_mode="interleave"
-        ).type_as(key)
+        xk_out = _npu_rotary_mul_shared_axis(key, cos.to(key.dtype), sin.to(key.dtype), "interleave").type_as(key)
         return xq_out, xk_out
 
 

@@ -87,6 +87,60 @@ class TilelangV41HcPost(HcPost):
     class Config(HcPost.Config):
         pass
 
+    def _prepare_inputs(self, y_bld, residual_bl_hcd, post_bl_hc, comb_bl_hc_hc):
+        y_was_2d = y_bld.ndim == 2
+        residual_was_3d = residual_bl_hcd.ndim == 3
+        post_was_2d = post_bl_hc.ndim == 2
+        comb_was_3d = comb_bl_hc_hc.ndim == 3
+        if residual_was_3d:
+            residual_bl_hcd = residual_bl_hcd.unsqueeze(0)
+        if post_was_2d:
+            post_bl_hc = post_bl_hc.unsqueeze(0)
+        if comb_was_3d:
+            comb_bl_hc_hc = comb_bl_hc_hc.unsqueeze(0)
+        if y_was_2d:
+            y_bld = y_bld.reshape(residual_bl_hcd.shape[0], residual_bl_hcd.shape[1], -1)
+        return y_bld, residual_bl_hcd, post_bl_hc, comb_bl_hc_hc, residual_was_3d
+
+    def _validate_inputs(self, y_bld, residual_bl_hcd, post_bl_hc, comb_bl_hc_hc) -> None:
+        if y_bld.device.type != "npu":
+            raise ValueError(f"TileLang V4.1 HcPost requires NPU inputs, got {y_bld.device}")
+        if y_bld.ndim != 3:
+            raise ValueError(f"TileLang V4.1 HcPost expects y with shape [B,S,D], got {tuple(y_bld.shape)}")
+        if residual_bl_hcd.ndim != 4:
+            raise ValueError(
+                f"TileLang V4.1 HcPost expects residual with shape [B,S,N,D], got {tuple(residual_bl_hcd.shape)}"
+            )
+        batch, seq, hidden = y_bld.shape
+        if residual_bl_hcd.shape[:2] != (batch, seq) or residual_bl_hcd.shape[-1] != hidden:
+            raise ValueError(
+                "TileLang V4.1 HcPost requires residual shape [B,S,N,D] to match y [B,S,D], "
+                f"got y={tuple(y_bld.shape)}, residual={tuple(residual_bl_hcd.shape)}"
+            )
+        num_streams = residual_bl_hcd.shape[2]
+        if post_bl_hc.shape != (batch, seq, num_streams):
+            raise ValueError(
+                "TileLang V4.1 HcPost requires post shape [B,S,N], "
+                f"got post={tuple(post_bl_hc.shape)} for y={tuple(y_bld.shape)} and N={num_streams}"
+            )
+        if comb_bl_hc_hc.shape != (batch, seq, num_streams, num_streams):
+            raise ValueError(
+                "TileLang V4.1 HcPost requires comb shape [B,S,N,N], "
+                f"got comb={tuple(comb_bl_hc_hc.shape)} for N={num_streams}"
+            )
+        if y_bld.dtype != torch.bfloat16 or residual_bl_hcd.dtype != torch.bfloat16:
+            raise ValueError(
+                "TileLang V4.1 HcPost requires y and residual to use torch.bfloat16, "
+                f"got y={y_bld.dtype}, residual={residual_bl_hcd.dtype}"
+            )
+        if post_bl_hc.dtype != torch.float32 or comb_bl_hc_hc.dtype != torch.float32:
+            raise ValueError(
+                "TileLang V4.1 HcPost requires post and comb to use torch.float32, "
+                f"got post={post_bl_hc.dtype}, comb={comb_bl_hc_hc.dtype}"
+            )
+        if any(not tensor.is_contiguous() for tensor in (y_bld, residual_bl_hcd, post_bl_hc, comb_bl_hc_hc)):
+            raise ValueError("TileLang V4.1 HcPost requires contiguous y, residual, post and comb inputs")
+
     def forward(
         self,
         y_BLD: torch.Tensor,
@@ -94,60 +148,10 @@ class TilelangV41HcPost(HcPost):
         post_BLHc: torch.Tensor,
         comb_BLHcHc: torch.Tensor,
     ) -> torch.Tensor:
-        # Sequence-parallel linears hand the collapsed stream back batch-folded
-        # (``[T, D]`` with B=1); normalize every operand to the explicit
-        # batch-first form the TileKernels kernel requires.
-        y_was_2d = y_BLD.ndim == 2
-        residual_was_3d = residual_BLHcD.ndim == 3
-        post_was_2d = post_BLHc.ndim == 2
-        comb_was_3d = comb_BLHcHc.ndim == 3
-        if y_was_2d:
-            y_BLD = y_BLD.unsqueeze(0)
-        if residual_was_3d:
-            residual_BLHcD = residual_BLHcD.unsqueeze(0)
-        if post_was_2d:
-            post_BLHc = post_BLHc.unsqueeze(0)
-        if comb_was_3d:
-            comb_BLHcHc = comb_BLHcHc.unsqueeze(0)
-
-        if y_BLD.device.type != "npu":
-            raise ValueError(f"TileLang V4.1 HcPost requires NPU inputs, got {y_BLD.device}")
-        if y_BLD.ndim != 3:
-            raise ValueError(f"TileLang V4.1 HcPost expects y with shape [B,S,D], got {tuple(y_BLD.shape)}")
-        if residual_BLHcD.ndim != 4:
-            raise ValueError(
-                f"TileLang V4.1 HcPost expects residual with shape [B,S,N,D], got {tuple(residual_BLHcD.shape)}"
-            )
-        batch, seq, hidden = y_BLD.shape
-        if residual_BLHcD.shape[:2] != (batch, seq) or residual_BLHcD.shape[-1] != hidden:
-            raise ValueError(
-                "TileLang V4.1 HcPost requires residual shape [B,S,N,D] to match y [B,S,D], "
-                f"got y={tuple(y_BLD.shape)}, residual={tuple(residual_BLHcD.shape)}"
-            )
-        num_streams = residual_BLHcD.shape[2]
-        if post_BLHc.shape != (batch, seq, num_streams):
-            raise ValueError(
-                "TileLang V4.1 HcPost requires post shape [B,S,N], "
-                f"got post={tuple(post_BLHc.shape)} for y={tuple(y_BLD.shape)} and N={num_streams}"
-            )
-        if comb_BLHcHc.shape != (batch, seq, num_streams, num_streams):
-            raise ValueError(
-                "TileLang V4.1 HcPost requires comb shape [B,S,N,N], "
-                f"got comb={tuple(comb_BLHcHc.shape)} for N={num_streams}"
-            )
-        if y_BLD.dtype != torch.bfloat16 or residual_BLHcD.dtype != torch.bfloat16:
-            raise ValueError(
-                "TileLang V4.1 HcPost requires y and residual to use torch.bfloat16, "
-                f"got y={y_BLD.dtype}, residual={residual_BLHcD.dtype}"
-            )
-        if post_BLHc.dtype != torch.float32 or comb_BLHcHc.dtype != torch.float32:
-            raise ValueError(
-                "TileLang V4.1 HcPost requires post and comb to use torch.float32, "
-                f"got post={post_BLHc.dtype}, comb={comb_BLHcHc.dtype}"
-            )
-        if any(not tensor.is_contiguous() for tensor in (y_BLD, residual_BLHcD, post_BLHc, comb_BLHcHc)):
-            raise ValueError("TileLang V4.1 HcPost requires contiguous y, residual, post and comb inputs")
-
+        y_BLD, residual_BLHcD, post_BLHc, comb_BLHcHc, residual_was_3d = self._prepare_inputs(
+            y_BLD, residual_BLHcD, post_BLHc, comb_BLHcHc
+        )
+        self._validate_inputs(y_BLD, residual_BLHcD, post_BLHc, comb_BLHcHc)
         out = tilelang_mhc_post(y_BLD, residual_BLHcD, post_BLHc.unsqueeze(-1), comb_BLHcHc)
         if residual_was_3d:
             out = out.squeeze(0)
