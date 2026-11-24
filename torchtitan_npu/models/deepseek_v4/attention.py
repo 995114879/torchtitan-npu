@@ -119,6 +119,14 @@ class CompressedSparseInnerAttention(Module):
             # backend attaches its own records.
             return DeepSeekV4Metadata.from_positions(positions, self.compress_ratio)
 
+        def build_aclgraph_metadata(self, positions, *, document_capacity, **_kwargs):
+            """Build fixed frames only for an enabled ACLGraph pass."""
+            if type(self) is not CompressedSparseInnerAttention.Config:
+                raise ValueError(f"ACLGraph fixed frames do not support {type(self).__qualname__}")
+            from .aclgraph_metadata import build_v4_metadata as build_fixed_metadata
+
+            return build_fixed_metadata(positions, self.compress_ratio, document_capacity=document_capacity)
+
     def __init__(self, config: Config) -> None:
         super().__init__()
         # Subclasses read ``self.window_size`` as an int.

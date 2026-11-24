@@ -280,6 +280,12 @@ class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
     class Config(DeepSeekV4Model.Config):
         pass
 
+    def prepare_aclgraph(self, **kwargs) -> None:
+        """Prepare this instance only when the ACLGraph pass is enabled."""
+        from .aclgraph import prepare_aclgraph_model
+
+        prepare_aclgraph_model(self, **kwargs)
+
     def init_states(
         self,
         *,

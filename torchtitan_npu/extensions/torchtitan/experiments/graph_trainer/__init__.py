@@ -20,6 +20,11 @@ from ...trainer import TrainerEx
 from . import auto_overlap, ep_overlap_deepep_guard
 
 
+def _load_graph_pass_components(pass_pipeline: str) -> None:
+    if pass_pipeline == "mutation-functionalization+aclgraph":
+        from . import aclgraph as aclgraph
+
+
 def _apply_auto_overlap_runtime_context_patch(config) -> None:
     if not auto_overlap.is_npu_auto_overlap_pipeline(config.compile.pass_pipeline):
         return
@@ -44,6 +49,7 @@ class GraphTrainerEx(TrainerEx, GraphTrainer):
         # stack (graph chunking + NPU auto-overlap scheduling) cannot
         # apply and would fail the graph build; drop it up front.
         ep_overlap_deepep_guard.disable_ep_overlap_for_deepep(config)
+        _load_graph_pass_components(config.compile.pass_pipeline)
         # This patch must wrap GraphTrainer before its first trace.
         _apply_auto_overlap_runtime_context_patch(config)
         super().__init__(config)

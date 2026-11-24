@@ -160,6 +160,38 @@ def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
 
 def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
     return [
+        # SMLA backward is nondeterministic. Check finite losses and completion
+        # with real routing; this is separate from numerical equivalence.
+        OverrideDefinitions(
+            test_name="dsv4_aclgraph_ep4_fsdp4",
+            test_descr="DeepSeek-V4 S640 joint ACLGraph merged backward EP4/FSDP4",
+            env_vars={
+                "MODULE": "torchtitan_npu.models.deepseek_v4",
+                "TRAIN_FILE": "torchtitan_npu.train",
+                "CONFIG": "graph_trainer_deepseek_v4_debugmodel",
+            },
+            override_args=[(*NPU_OVERRIDES,
+                "--training.steps=4", "--training.global-batch-size=4",
+                "--training.local-batch-size=1", "--training.seq-len=640",
+                "--parallelism.data-parallel-shard-degree=4",
+                "--parallelism.data-parallel-replicate-degree=1",
+                "--parallelism.expert-parallel-degree=4",
+                "--parallelism.spmd-backend=partial_dtensor",
+                "--compile.mode=aot_fx_trace", "--compile.backend=aot_eager",
+                "--compile.inductor-compilation=regional", "--compile.memory-policy=full",
+                "--compile.ep-overlap.no-enabled",
+                "--compile.pass-pipeline=mutation-functionalization+aclgraph",
+                "--extension.quantization.no-enable-quantized-training",
+                "--extension.quantization.no-enable-fsdp-prequantize",
+                "--hf-assets-path=tests/assets/deepseek_v3",
+                "--debug.no-moe-force-load-balance", "--debug.seed=42",
+            )],
+            ngpu=4,
+            timeout=900,
+            use_golden=False,
+            check_loss=False,
+            expected_steps=((1, 2, 3, 4),),
+        ),
         OverrideDefinitions(
             test_name="dsv4_anticipatory_recovery",
             test_descr="DeepSeek-V4 CLI loss spike, native checkpoint rollback and route replay",

@@ -72,6 +72,7 @@ python -m tests.integration_tests.run_tests \
 | **`dsv4_smla_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2，`aot_eager` | 2 | 否 | SMLA 算子在 EP+FSDP 分布式环境下的执行与 MoE Dispatcher 验证 |
 | **`dsv4_smla_cp2_ep2_fsdp2`** | DeepSeek-V4 | CP2 + EP2 + FSDP2 | 4 | 否 | 混合并行（Context Parallel + Expert Parallel）算子冒烟 |
 | **`dsv4_mtp_smla_cp2`** | DeepSeek-V4 MTP | CP2（连续切片） | 2 | 否 | 覆盖 MTP forward、chunked loss 及 backward 算子路径 |
+| **`dsv4_aclgraph_ep4_fsdp4`** | DeepSeek-V4 debug | EP4 + FSDP4，S=640，普通管线 + ACLGraph，关闭 EP overlap | 4 | 否 | 验证 ACLGraph 的 warmup、capture 和 replay 完成 |
 | **`dsv3_2_dsa_1rank`** | DeepSeek-V3.2 | 1 Rank，DSA 算子 | 1 | **是** | 校验 DSA attention override 并在 1-rank 下做数值 Loss 比对 |
 | **`dsv3_2_dsa_ep2_fsdp2`** | DeepSeek-V3.2 | DSA + EP2/FSDP2 | 2 | **是** | 校验分布式 DSA 算子 30-step 精度对齐 |
 | **`dsv3_2_dsa_cp2`** | DeepSeek-V3.2 | DSA + CP2 | 2 | 否 | 校验 DSA 在 CP2 模式下的训练触发与通信 |

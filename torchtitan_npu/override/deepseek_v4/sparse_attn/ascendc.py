@@ -399,3 +399,16 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
             del padding_mask, max_num_documents, max_context_length
             metadata = DeepSeekV4Metadata.from_positions(positions, self.compress_ratio)
             return AscV4Metadata.build_aicpu_metadata(metadata, geometry=self.geometry)
+
+        def build_aclgraph_metadata(self, positions, *, document_capacity, **_kwargs):
+            """Build this backend's AI_CPU metadata from ACLGraph's fixed frames."""
+            from torchtitan_npu.models.deepseek_v4.aclgraph_metadata import build_v4_metadata
+
+            metadata = build_v4_metadata(positions, self.compress_ratio, document_capacity=document_capacity)
+            if hasattr(self, "quant_mode"):
+                from torchao_npu.quantized_modules.deepseek_v4.attention_metadata import QuantV4Metadata
+
+                return QuantV4Metadata.build_aicpu_metadata(
+                    metadata, geometry=self.geometry, quant_mode=self.quant_mode
+                )
+            return AscV4Metadata.build_aicpu_metadata(metadata, geometry=self.geometry)

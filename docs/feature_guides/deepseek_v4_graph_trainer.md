@@ -103,9 +103,11 @@ torchrun --nproc_per_node=8 -m torchtitan.train \
 | Context Parallel | 不支持（DSV4 稀疏注意力编译路径未适配 CP） |
 | EP overlap（上游实验性 pass） | 已通过 patch 适配；标准 all-to-all dispatcher 路径生效 |
 | DeepEP MoE backend | 有限支持：`graph_trainer_*_deepep` 配置与 `asc_deepep` override 可用，但 EP overlap pass 在该组合下自动关闭 |
+| ACLGraph 分段入图 | 通过 `mutation-functionalization+aclgraph` pipeline 启用；要求 `aot_fx_trace`、`inductor_compilation=regional`、关闭 EP overlap、PP=1、CP=1、MTP=0，不与 Auto Overlap 叠加。实现及 A3 验证记录见 [ACLGraph 指南](dsv4_aclgraph_implementation.md) |
 
 ## 相关文档
 
 - 上游 GraphTrainer 说明与 EP overlap 用法：[`torchtitan/experiments/graph_trainer/README.md`](https://github.com/pytorch/torchtitan/blob/main/torchtitan/experiments/graph_trainer/README.md)
 - EP overlap 适配：[`graph_trainer_ep_overlap.md`](graph_trainer_ep_overlap.md)
+- ACLGraph 分段入图、启用限制与 A3 验证：[`dsv4_aclgraph_implementation.md`](dsv4_aclgraph_implementation.md)
 - DSV4 稀疏注意力与 TND 融合路径：[`deepseek_v4_tnd.md`](deepseek_v4_tnd.md)
