@@ -29,7 +29,9 @@ if TYPE_CHECKING:
 def reset_failed_iteration(model_parts):
     """Call only after device recovery, before starting another attempt."""
     for model in model_parts:
-        if isinstance(model, FSDPModule):
+        # FSDP sets the root flag on its first forward, before initializing
+        # communication state. Untouched model parts have no work to reset.
+        if isinstance(model, FSDPModule) and model._get_fsdp_state()._is_root is not None:
             model.reset_iter_state()
         for parameter in model.parameters():
             parameter.grad = None
@@ -93,7 +95,7 @@ class StepRecovery:
             self._manager.discard_interrupted_step(error)
             self._lr_schedulers.step()
             logger.warning(
-                "Discarded interrupted TorchFT attempt %d after device recovery; next step reads new data",
+                "Discarded interrupted TorchFT attempt after device recovery (snapshot step %d); reading new data next",
                 attempt_state["step"],
             )
             return

@@ -43,6 +43,10 @@ ASCEND_SET_ENV_PATH=/path/to/ascend-toolkit/set_env.sh \
 
 DeepSeek V3 单卡训练任务可直接使用 `scripts/run_train.sh` 启动。`scripts/run_train.sh` 默认使用 1 张 NPU 和 `deepseek_v3_debugmodel` 配置，并把额外命令行参数原样透传给训练入口。
 
+使用 DeepSeek-V4 Flash TorchFT 遗言功能时，先独立启动 Lighthouse 与遗言 service，再为各 replica 配置凭据及 `--fault-tolerance.last-words.enable`。训练入口仍使用普通 torchrun，`NGPU` 表示当前节点为该 replica 启动的进程数；配置见 [TorchFT 遗言指南](../feature_guides/torchft_last_words.md#启动方式)。
+
+每个 replica 的 FSDP/EP 分片跨机器时，在该 replica 的每个节点分别启动 `run_train_multinodes.sh`，在各节点设置相同的 `NODE_IPS`（仅列出该 replica 的节点 IP，按节点顺序排列）和 `MASTER_PORT`。脚本按本机 IP 在列表中的位置计算 `NODE_RANK`，默认以首节点为 `MASTER_ADDR`。遗言 service 只协调一次保存，不托管节点进程、不重新拉起训练或替换失败的 writer；拓扑示例见同一指南。
+
 ### 单卡训练任务
 
 以下示例在默认配置上显式启用实数 RoPE 兼容实现，避免对复数 RoPE cache 进行位置索引：

@@ -52,6 +52,9 @@ class ProcessGroupHCCLEx(ProcessGroupWrapper):
         group_world_size: int | None = None,
         global_ranks: list[int] | None = None,
     ) -> None:
+        stop_requested = getattr(self.recovery, "last_words_stop_requested", None)
+        if stop_requested is not None and stop_requested():
+            raise RuntimeError("last words stop requested; cannot configure another quorum")
         # Lighthouse advances the quorum ID after a rejected commit, which gives
         # every rank a new prefix. Never rebuild HCCL with stale rendezvous keys.
         if store_addr in self._used_store_addresses:

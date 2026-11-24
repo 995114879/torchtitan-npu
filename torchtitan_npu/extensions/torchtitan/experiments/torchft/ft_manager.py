@@ -7,7 +7,7 @@
 """Synchronous TorchFT manager for the NPU FSDP/EP training path."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 import torch
@@ -16,6 +16,7 @@ import torchft
 from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 from torchtitan.experiments.torchft.manager import TorchFTManager
 
+from torchtitan_npu.extensions.torchtitan.experiments.torchft.last_words.worker import LastWordsConfig
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
 
@@ -57,6 +58,8 @@ def _install_all_reduce_hooks(
 
 
 class FTManagerEx(TorchFTManager):
+    manager: ManagerEx  # pyrefly: ignore [bad-override-mutable-attribute]
+
     @dataclass(kw_only=True, slots=True)
     class Config(TorchFTManager.Config):
         enable: bool = True
@@ -66,9 +69,15 @@ class FTManagerEx(TorchFTManager):
         device_recovery_timeout_seconds: int = 60
         max_consecutive_hccl_recoveries: int = 3
         quorum_warmup_timeout_ms: int = 90000
+        enable_elastic: bool = True
+        """Allow runtime replica shrink, healing and externally initiated rejoin."""
+        last_words: LastWordsConfig = field(default_factory=LastWordsConfig)
 
     @staticmethod
     def validate_config(config: Config) -> None:
+        config.last_words.validate()
+        if not config.enable_elastic and config.min_replica_size != config.group_size:
+            raise ValueError("Fixed membership requires min_replica_size == group_size")
         if not config.enable or config.process_group != "hccl":
             raise ValueError("NPU TorchFT requires enabled HCCL fault tolerance")
         if config.semi_sync_method is not None:
@@ -108,6 +117,7 @@ class FTManagerEx(TorchFTManager):
             init_sync=True,
             quorum_timeout=timedelta(seconds=config.quorum_timeout_seconds),
         )
+        self._manager.elastic_enabled = config.enable_elastic
         self.replicate_pg = torchft.process_group.ManagedProcessGroup(self._manager)
         self.replicate_pg.register("dp_replicate")
 

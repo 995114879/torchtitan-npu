@@ -18,6 +18,8 @@
 
 新增或迁移代码先读取[架构边界](docs/architecture.md)及目标目录的 `AGENTS.md`。当前自动导入顺序为 `patches → config → extensions → ops`；`patches → extensions` 是后续收敛目标。extensions 可以依赖 patches；patches 不得新增对 extensions 的依赖。
 
+TorchFT 遗言 service 与 worker 控制实现归入对应 extension；仓库 launcher 使用普通 torchrun，不承担进程监督或重新拉起。集成测试通过标准 runner 注册，验证机专用审计工具留在仓库外。
+
 `extensions/torchtitan/config/override.py` 是 `apply_overrides` 配置观察包装的唯一 owner，在 EP process-group 扩展之后、trainer 扩展之前激活，并刷新已加载的 config、trainer、TorchFT 同名捕获绑定。它委托 `patches/torchtitan/config/override.py` 中的 TorchTitan v0.3.0 补丁执行替换并合并 `[Override]` 成功日志，在扩展里保留零命中候选、解析失败/冲突分类以及最终 Config owner、量化和几何汇总。`[Override configured]` 仅表示构建前选定实现，不表示设备 kernel 已执行；不修改工厂执行次数或张量计算。
 
 ## 上游与验证

@@ -144,19 +144,57 @@ with patch.object(module.FaultTolerantTrainer, '__init__', initialize_once), \\
                 raise AssertionError('accepted incompatible TorchFT manager')
         recovery.assert_not_called()
 
-class AuxiliaryLoss(torch.nn.Module):
-    # The production aux-loss state: a per-instance accumulator buffer and the
-    # per-group step registers the optimizer pre-hook fills.
-    group_acc = {'loss': 3.0}
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
-    def __init__(self):
-        super().__init__()
-        self.register_buffer('instance_acc', torch.tensor(3.0), persistent=False)
-
-auxiliary = AuxiliaryLoss()
+auxiliary = AuxLoss(AuxLoss.Config(coeff=1.0))
+auxiliary.instance_acc.fill_(3.0)
+AuxLoss.group_acc[('batch', auxiliary.metric_name)] = torch.tensor(3.0)
 module.FaultTolerantTrainerEx._reset_auxiliary_state(Mock(model_parts=[auxiliary]))
 assert auxiliary.instance_acc.item() == 0
-assert AuxiliaryLoss.group_acc == {}
+assert AuxLoss.group_acc == {}
+"""
+    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+
+
+def test_ft_train_step_normalizes_auxiliary_gradients_by_all_valid_tokens():
+    program = """
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+import torch
+from torchtitan_npu.extensions.torchtitan.experiments.torchft import trainer as module
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
+
+auxiliary = AuxLoss(AuxLoss.Config(coeff=1.0))
+AuxLoss._step_denominator = None
+observed = []
+def forward_backward(**kwargs):
+    raw = torch.tensor(2.0, requires_grad=True)
+    carrier = torch.tensor(0.0, requires_grad=True)
+    auxiliary.inject(raw, carrier=carrier).backward()
+    observed.append(raw.grad.item())
+
+trainer = SimpleNamespace(
+    optimizers=Mock(), lr_schedulers=SimpleNamespace(schedulers=[Mock(get_last_lr=lambda: [0.1])]),
+    metrics_processor=Mock(should_log=lambda _: False), step=1,
+    config=SimpleNamespace(training=SimpleNamespace(disable_cuda_graphs=True, max_norm=1.0)),
+    parallel_dims=Mock(dp_enabled=True, pp_enabled=False, ep_enabled=False),
+    gradient_accumulation_steps=2, num_pipeline_parallel_microbatches=1,
+    device=torch.device('cpu'), forward_backward_step=forward_backward,
+    model_parts=[], checkpointer=Mock(), _step_optimizer_and_scheduler=Mock(),
+)
+# Two accumulation microbatches have 2 + 1 valid tokens. A peer contributes
+# another 3, then 5 on the next step; every local aux gradient must use 6, then 8.
+for peer_tokens, expected in [(3, 1 / 6), (5, 1 / 8)]:
+    batches = iter([({}, torch.tensor([1, 2, -100])), ({}, torch.tensor([3, -100, -100]))])
+    def sum_tokens(local, mesh):
+        assert local.item() == 3
+        return local + peer_tokens
+    with patch.object(module.dist_utils, 'dist_sum_tensor', side_effect=sum_tokens), \\
+         patch.object(module.dist_utils, 'clip_grad_norm_'):
+        module.FaultTolerantTrainerEx._train_step(trainer, batches)
+    torch.testing.assert_close(torch.tensor(observed[-2:]), torch.tensor([expected, expected]))
+assert trainer._step_optimizer_and_scheduler.call_count == 2
 """
     result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr

@@ -7,8 +7,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from torchtitan.components.optimizer import ParamGroupConfig
+import torch.distributed.checkpoint as dcp
+from torchtitan.components.checkpoint import LR_SCHEDULER, OPTIMIZER, AsyncMode
+from torchtitan.components.optimizer import LRSchedulersContainer, ParamGroupConfig
 
+from torchtitan_npu.extensions.torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManagerEx
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer_recovery import build_optimizer_recovery
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
@@ -59,6 +62,35 @@ def test_accepted_step_updates_parameter_once_and_advances_scheduler_once(monkey
     assert hooks == ["step"]
     manager.should_commit.assert_called_once_with()
     manager._begin_step.assert_called_once_with()
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["current", "legacy-cache"])
+def test_periodic_checkpoint_restores_decayed_lr_before_next_update(tmp_path, legacy):
+    def states():
+        _, optimizer, _ = make_optimizer(True)
+        schedule = LRSchedulersContainer(optimizer, lambda epoch: 0.5**epoch)
+        optimizer.init_cache_state_dict()
+        return {OPTIMIZER: optimizer, LR_SCHEDULER: schedule}
+
+    writer = states()
+    writer[OPTIMIZER].optimizers[0].step()
+    writer[LR_SCHEDULER].step()
+    manager = TorchFTCheckpointManagerEx.__new__(TorchFTCheckpointManagerEx)
+    manager.enable = manager.verify_hash_manifest = False
+    manager.states, manager.ema_optimizer = {}, None
+    if legacy:
+        dcp.save(writer, checkpoint_id=tmp_path)
+    else:
+        manager.dcp_save(writer, str(tmp_path), AsyncMode.DISABLED)
+
+    raw = {OPTIMIZER: {"param_groups.weight.lr": 0.0}}
+    dcp.load(raw, checkpoint_id=tmp_path)
+    assert raw[OPTIMIZER]["param_groups.weight.lr"] == (0.1 if legacy else 0.05)
+
+    reader = states()
+    manager.dcp_load(reader, str(tmp_path))
+    assert reader[OPTIMIZER].optimizers[0].param_groups[0]["lr"] == 0.05
+    assert reader[LR_SCHEDULER].state_dict() == {"last_epoch": 1}
 
 
 def test_rejected_step_skips_optimizer_and_preserves_upstream_scheduler_advancement():

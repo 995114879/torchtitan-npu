@@ -85,8 +85,15 @@ def build_engram_cp_test_list():
     return build()
 
 
+def build_last_words_test_list():
+    from tests.integration_tests.last_words import build_last_words_test_list as build
+
+    return build()
+
+
 # torchtitan-npu override: register the DeepSeek-V4, V4.1 and V3.2 NPU suites.
 _TEST_SUITES_FUNCTION = {
+    "torchft_last_words": build_last_words_test_list,
     "models": build_models_test_list,
     "deepseek_v3_2": build_deepseek_v3_2_test_list,
     "deepseek_v4": build_deepseek_v4_test_list,
@@ -647,6 +654,14 @@ def _filter_tests(
             continue
         if args.ngpu < test_flavor.ngpu:
             skipped_ngpu.append(test_flavor)
+            continue
+        env = {**os.environ, **(test_flavor.env_vars or {})}
+        missing = [name for name in test_flavor.required_env if not env.get(name)]
+        if missing:
+            message = f"{test_flavor.test_name} requires {', '.join(missing)}"
+            if args.test_name != "all":
+                raise ValueError(message)
+            log_print(f"Skipping {message}")
             continue
         runnable.append(test_flavor)
     return runnable, skipped_ngpu

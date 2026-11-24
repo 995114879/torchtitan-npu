@@ -55,5 +55,5 @@ else
     torchrun --nproc_per_node="${NGPU}" --rdzv_backend c10d \
     --rdzv_endpoint="localhost:0" \
     --local-ranks-filter "${LOG_RANK}" --role rank --tee 3 \
-    -m "${TRAIN_FILE}" --module "${MODULE}" --config "${CONFIG}" "$@" 2>&1 | tee -a logs/${logfile}
+    -m "${TRAIN_FILE}" --module "${MODULE}" --config "${CONFIG}" "$@" 2>&1 | tee -a "logs/${logfile}"
 fi

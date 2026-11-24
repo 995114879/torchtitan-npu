@@ -7,10 +7,13 @@
 
 from importlib.metadata import PackageNotFoundError, distribution
 from importlib.util import find_spec
+from pathlib import Path
 
-collect_ignore_glob = []
+collect_ignore = []
 if find_spec("torchft") is None:
     try:
         distribution("torchft")
     except PackageNotFoundError:
-        collect_ignore_glob = ["test_*.py"]
+        # The control service runs without TorchFT.
+        test_files = Path(__file__).parent.glob("test_*.py")
+        collect_ignore = [path.name for path in test_files if path.stem != "test_last_words_service"]

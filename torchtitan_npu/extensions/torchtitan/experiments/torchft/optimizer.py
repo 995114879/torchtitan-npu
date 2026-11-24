@@ -26,6 +26,8 @@ class TorchFTOptimizersContainerEx(TorchFTOptimizersContainer):
         pass
 
     def __init__(self, config, *, model_parts, ft_manager):
+        self.last_words = None
+        self.last_words_pre_authorized = False
         self.hccl_recovery = ft_manager.process_group.recovery
         super().__init__(config, model_parts=model_parts, ft_manager=ft_manager)
         self._transaction_manager = ft_manager.manager
@@ -47,8 +49,11 @@ class TorchFTOptimizersContainerEx(TorchFTOptimizersContainer):
     ) -> float | None:
         if closure is not None:
             raise ValueError("TorchFT optimizer does not support closures")
-        if not self._transaction_manager.should_commit():
-            return None
+        if self.last_words is None:
+            if not self._transaction_manager.should_commit():
+                return None
+        elif not self.last_words_pre_authorized:
+            raise RuntimeError("Last-words optimizer must be authorized before container pre-hooks")
         self.hccl_recovery.apply_optimizer(self._step_optimizers)
 
     def _step_optimizers(self) -> None:

@@ -8,18 +8,26 @@ from dataclasses import replace
 from tests.integration_tests import OverrideDefinitions
 from tests.integration_tests.deepep import build_deepep_test_list
 
+
 # DeepSeek-V4 NPU recipe from the example scripts.  Ascend attention and MHC
 # overrides are only used on the fused path.
-NPU_OVERRIDES = (
-    "--override.imports",
-    "torchtitan_npu.override.common.rms_norm.asc",
-    "torchtitan_npu.override.common.rope.asc_complex",
-    "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
-    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}',
-    "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
-    "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
-    "torchtitan_npu.override.common.token_dispatcher.asc",
-)
+def npu_overrides(*, debug_model: bool) -> tuple[str, ...]:
+    sparse_attention = "torchtitan_npu.override.deepseek_v4.sparse_attn.asc"
+    if debug_model:
+        sparse_attention += '={"num_heads":16,"index_num_heads":8}'
+    return (
+        "--override.imports",
+        "torchtitan_npu.override.common.rms_norm.asc",
+        "torchtitan_npu.override.common.rope.asc_complex",
+        "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
+        sparse_attention,
+        "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
+        "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
+        "torchtitan_npu.override.common.token_dispatcher.asc",
+    )
+
+
+NPU_OVERRIDES = npu_overrides(debug_model=True)
 
 # DeepSeek-V4 reference recipe. It runs the model-dir default (attn-gym's
 # reference attention and the reference MoE token dispatcher) so the checked-in
@@ -170,22 +178,30 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "TRAIN_FILE": "torchtitan_npu.train",
                 "CONFIG": "graph_trainer_deepseek_v4_debugmodel",
             },
-            override_args=[(*NPU_OVERRIDES,
-                "--training.steps=4", "--training.global-batch-size=4",
-                "--training.local-batch-size=1", "--training.seq-len=640",
-                "--parallelism.data-parallel-shard-degree=4",
-                "--parallelism.data-parallel-replicate-degree=1",
-                "--parallelism.expert-parallel-degree=4",
-                "--parallelism.spmd-backend=partial_dtensor",
-                "--compile.mode=aot_fx_trace", "--compile.backend=aot_eager",
-                "--compile.inductor-compilation=regional", "--compile.memory-policy=full",
-                "--compile.ep-overlap.no-enabled",
-                "--compile.pass-pipeline=mutation-functionalization+aclgraph",
-                "--extension.quantization.no-enable-quantized-training",
-                "--extension.quantization.no-enable-fsdp-prequantize",
-                "--hf-assets-path=tests/assets/deepseek_v3",
-                "--debug.no-moe-force-load-balance", "--debug.seed=42",
-            )],
+            override_args=[
+                (
+                    *NPU_OVERRIDES,
+                    "--training.steps=4",
+                    "--training.global-batch-size=4",
+                    "--training.local-batch-size=1",
+                    "--training.seq-len=640",
+                    "--parallelism.data-parallel-shard-degree=4",
+                    "--parallelism.data-parallel-replicate-degree=1",
+                    "--parallelism.expert-parallel-degree=4",
+                    "--parallelism.spmd-backend=partial_dtensor",
+                    "--compile.mode=aot_fx_trace",
+                    "--compile.backend=aot_eager",
+                    "--compile.inductor-compilation=regional",
+                    "--compile.memory-policy=full",
+                    "--compile.ep-overlap.no-enabled",
+                    "--compile.pass-pipeline=mutation-functionalization+aclgraph",
+                    "--extension.quantization.no-enable-quantized-training",
+                    "--extension.quantization.no-enable-fsdp-prequantize",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--debug.no-moe-force-load-balance",
+                    "--debug.seed=42",
+                )
+            ],
             ngpu=4,
             timeout=900,
             use_golden=False,

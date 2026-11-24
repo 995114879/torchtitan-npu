@@ -75,6 +75,10 @@ patch 替换后必须刷新或说明上游 `from ... import ...` 已捕获的绑
 
 `extensions/` 当前还包含 `adaptor/`、`cpu_offload/`、`distributed/`、`mx_storage_reader/`、`novaswap/` 与 `experiment/`。其中仅包入口显式列出的模块自动加载；其余目录由调用路径按需导入。各目录的职责和加载方式见 [extensions 规则](../torchtitan_npu/extensions/AGENTS.md)。
 
+TorchFT 遗言协调 service 只维护保存状态与授权，独立网络端点采用双向 TLS；单机可使用 loopback HTTP。训练由各节点的普通 torchrun 启动，作业生命周期由用户或外部调度平台管理。service 不使用 SSH、不启动或重新拉起进程；一次故障只授权一个完整健康 replica 保存，writer 失败后结束会话，不再重选。
+
+TorchFT 遗言 service、worker 和配套 checkpoint 实现随 `extensions/torchtitan/experiments/torchft/last_words/` 分发。service 通过文件入口和同目录轻量加载启动，避免触发训练包的初始化；worker 在训练进程内维护心跳和安全边界。`tests/integration_tests/` 保留标准 runner 所需的测试定义、训练辅助和模型配置，验证机专用 Docker/NPU 审计工具不随仓库分发。
+
 `extensions/torchtitan/config/override.py` 是 `apply_overrides` 配置观察包装的唯一 owner，在 EP process-group 扩展之后、trainer 扩展之前激活，并刷新已加载的 config、trainer、TorchFT 同名捕获绑定。它委托 `patches/torchtitan/config/override.py` 中的 TorchTitan v0.3.0 补丁执行替换并合并 `[Override]` 成功日志，在扩展里保留零命中候选、解析失败/冲突分类以及最终 Config owner、量化和几何汇总。`[Override configured]` 仅表示构建前选定实现，不表示设备 kernel 已执行；不修改工厂执行次数或张量计算。
 
 ### override、models 与 ops

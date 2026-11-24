@@ -447,8 +447,9 @@ def _torchft_flash_config(
     # Check the optional dependency before importing upstream TorchFT modules.
     import_module("torchtitan_npu.extensions.torchtitan.experiments.torchft")
 
-    from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
-
+    from torchtitan_npu.extensions.torchtitan.experiments.torchft.last_words.checkpoint import (
+        LastWordsCheckpointManager,
+    )
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.trainer import FaultTolerantTrainerEx
 
@@ -458,9 +459,9 @@ def _torchft_flash_config(
         }
 
     values = config_values(base, FaultTolerantTrainerEx.Config)
-    checkpoint_values = config_values(base.checkpoint, TorchFTCheckpointManager.Config)
+    checkpoint_values = config_values(base.checkpoint, LastWordsCheckpointManager.Config)
     checkpoint_values.update(enable=True, enable_ft_dataloader_checkpoints=True)
-    values["checkpoint"] = TorchFTCheckpointManager.Config(**checkpoint_values)
+    values["checkpoint"] = LastWordsCheckpointManager.Config(**checkpoint_values)
     values["optimizer"] = TorchFTOptimizersContainerEx.Config(
         **config_values(base.optimizer, TorchFTOptimizersContainerEx.Config)
     )

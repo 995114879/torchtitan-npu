@@ -44,8 +44,9 @@ class HcclRecovery:
         self._get_process_group = get_process_group
         self._clear_process_group = clear_process_group
         self.work_tracker = HcclWorkTracker(self._schedule_recovery)
-        self._recovery_lock = threading.Lock()
         self._recovery_requested = threading.Event()
+        self._terminal_lock = threading.Lock()
+        self._terminal_check: threading.Event | None = None
         self._stop_observed = threading.Event()
         self._device_ready = threading.Event()
         self._device_ready.set()
@@ -54,6 +55,9 @@ class HcclRecovery:
         self._device_index: int | None = None
         self.num_device_recoveries = 0
         self.optimizer_update_completed = False
+        self.last_words_request = None
+        self.last_words_stop_requested: Callable[[], bool] | None = None
+        self._last_words_interrupt_work: tuple[int, int] | None = None
 
     @property
     def watchdog_timeout(self):
@@ -78,13 +82,33 @@ class HcclRecovery:
 
     @contextmanager
     def track_collective(self):
-        self._raise_if_recovering()
-        # HCCL can block before returning a Work, including initial connection.
-        token = self.work_tracker.track(self._collective_timeout)
+        with self.work_tracker.boundary_lock:
+            self._raise_if_recovering()
+            if self.last_words_stop_requested is not None and self.last_words_stop_requested():
+                raise HcclRecoveryError("Last words stop requested; refuse another HCCL collective")
+            # Register before releasing the boundary lock. A stop notification
+            # racing with this launch then sees an owned token even if native
+            # HCCL has not returned a Work yet.
+            token = self.work_tracker.track(self._collective_timeout)
         try:
             yield
+        except RuntimeError:
+            # A native launch interrupted before returning Work may report a
+            # backend-specific error. Preserve the existing recovery handshake
+            # instead of letting cleanup touch the stopped device early.
+            self._raise_if_recovering()
+            raise
         finally:
             self.work_tracker.complete(token)
+
+    def request_last_words_stop(self):
+        # A local exception can race the heartbeat callback. Both observe the
+        # same ownership decision before the training thread touches the device.
+        with self._terminal_lock:
+            if self._terminal_check is None:
+                self._terminal_check = threading.Event()
+                self._schedule_recovery(None, self.work_tracker.generation, self._terminal_check)
+            return self._terminal_check
 
     def wrap_work(self, pg, work, opts):
         timeout = self._collective_timeout
@@ -106,6 +130,15 @@ class HcclRecovery:
                 try:
                     if tracked_work.is_completed():
                         break
+                    if self.last_words_stop_requested is not None and self.last_words_stop_requested():
+                        generation = self.work_tracker.generation
+                        interruption = (tracked_work._token, generation)
+                        if self._last_words_interrupt_work != interruption:
+                            # A confirmed save request must not wait for the
+                            # longer communication timer. Retain exact work
+                            # ownership and the existing optimizer/restart gate.
+                            self._last_words_interrupt_work = interruption
+                            self._schedule_recovery(*interruption)
                 except RuntimeError:
                     self._raise_if_recovering()
                     raise
@@ -146,25 +179,34 @@ class HcclRecovery:
         if self._recovery_requested.is_set():
             raise HcclRecoveryError("The interrupted HCCL attempt must finish before retrying")
 
-    def _schedule_recovery(self, token, generation):
+    def _schedule_recovery(self, token, generation, checked=None):
         # Never block the timer callback on communicator destruction.
-        thread = threading.Thread(target=self._recover_device, args=(token, generation), daemon=True)
+        thread = threading.Thread(target=self._recover_device, args=(token, generation, checked), daemon=True)
         thread.start()
 
-    def _recover_device(self, token, generation):
-        self._recovery_lock.acquire()
+    def _recover_device(self, token, generation, checked=None):
+        stop_reason = None
+        owner = False
         try:
             with self.work_tracker.boundary_lock:
                 pg = self._get_process_group()
                 if generation != self.work_tracker.generation or pg is None:
                     return
-                if not self.work_tracker.has_active_work(token) or self._recovery_requested.is_set():
+                if self._recovery_requested.is_set() or not self.work_tracker.has_active_work(token):
                     return
+                owner = True
                 assert self._device_index is not None
                 self._device_ready.clear()
                 self._stop_observed.clear()
                 self._recovery_requested.set()
+                if checked is not None:
+                    checked.set()
                 self._errored = HcclRecoveryError("HCCL communication timed out during an uncommitted attempt")
+                if self.last_words_request is not None:
+                    stop_reason = str(self._errored)
+                    # Set the stop request before device recovery or diagnostic
+                    # I/O can block so the heartbeat can report it.
+                    self.last_words_request()
                 backend = cast("Any", pg._get_backend(torch.device("npu")))
                 import torch_npu
 
@@ -196,8 +238,12 @@ class HcclRecovery:
             self._recovery_error = error
             logger.exception("TorchFT HCCL device recovery failed")
         finally:
-            self._device_ready.set()
-            self._recovery_lock.release()
+            if owner:
+                self._device_ready.set()
+            if checked is not None:
+                checked.set()
+        if stop_reason is not None and self.last_words_request is not None:
+            self.last_words_request(stop_reason)
 
     def recover(self, error: Exception) -> bool:
         """Acknowledge the expected stop, then wait before accessing device state."""
@@ -205,14 +251,28 @@ class HcclRecovery:
             return False
         if not isinstance(error, HcclRecoveryError) and "FORCE STOP" not in str(error).upper():
             return False
+        self._wait_for_device(error)
+        return True
+
+    def prepare_for_terminal_save(self):
+        """Observe the stop and wait within one budget, even if a native call stalls."""
+        deadline = time.monotonic() + self.recovery_timeout.total_seconds()
+        checked = self.request_last_words_stop()
+        if not self._recovery_requested.is_set() and not checked.wait(max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("Timed out waiting for the terminal HCCL work check")
+        if self._recovery_requested.is_set():
+            self._wait_for_device(timeout=max(0.0, deadline - time.monotonic()))
+        elif self._recovery_error is not None:
+            raise RuntimeError("TorchFT NPU device recovery failed") from self._recovery_error
+
+    def _wait_for_device(self, error=None, *, timeout=None):
         self._stop_observed.set()
-        if not self._device_ready.wait(self.recovery_timeout.total_seconds()):
+        if not self._device_ready.wait(self.recovery_timeout.total_seconds() if timeout is None else timeout):
             raise TimeoutError("Timed out waiting for TorchFT NPU device recovery") from error
         if self._recovery_error is not None:
             raise RuntimeError("TorchFT NPU device recovery failed") from self._recovery_error
         self._recovery_requested.clear()
         self._errored = None
-        return True
 
     def begin_attempt(self):
         self.optimizer_update_completed = False

@@ -6,16 +6,20 @@
 
 import copy
 from datetime import timedelta
+from inspect import signature
 from threading import Event
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.distributed as dist
+import torch_npu
 from torch.distributed.tensor import DTensor
 from torch.utils._pytree import tree_flatten, tree_unflatten
 from torchft.manager import Manager
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
 
 
@@ -65,14 +69,20 @@ class TorchFTCommitTimeoutError(RuntimeError):
     """A commit result is unknown; torchrun must restart the whole replica."""
 
 
+class TorchFTQuorumStoppedError(RuntimeError):
+    """Terminal saving interrupted CPU quorum before an optimizer vote."""
+
+
 class ManagerEx(Manager):
-    _pg: "ProcessGroupHCCLEx"
+    _pg: "ProcessGroupHCCLEx"  # pyrefly: ignore [bad-override, bad-override-mutable-attribute]
     _user_state_dicts: dict[str, Any]
     _quorum_future: Any
     _pending_state_dict: Any
     _recovery_event: Any
     _quorum_id: int
     _group_world_size: int
+    _group_rank: int
+    _commit_failures: int
     _checkpoint_transport: Any
     _quorum_timeout: timedelta
 
@@ -90,17 +100,46 @@ class ManagerEx(Manager):
 
         def state_dict(self) -> dict[str, int]: ...
 
+        def load_state_dict(self, state_dict: dict[str, int]) -> None:
+            """Restore the upstream manager's training progress."""
+            ...
+
+        def participating_rank(self) -> int | None:
+            """Return this replica's rank in the participating quorum, if any."""
+            ...
+
+        def errored(self) -> Any:
+            """Read the error recorded by the upstream manager."""
+            ...
+
+        def num_participants(self) -> int:
+            """Return the number of replicas participating in the quorum."""
+            ...
+
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        arguments = signature(Manager.__init__).bind(self, *args, **kwargs)
+        if arguments.arguments.get("use_async_quorum", False):
+            raise ValueError("Last words requires synchronous quorum and healing")
+        arguments.arguments["use_async_quorum"] = False
+        super().__init__(*arguments.args[1:], **arguments.kwargs)
         self.commit_authorized = False
+        self.commit_decided = False
+        self.commit_unknown = False
         self._initial_quorum_barrier_pending = True
         self._healing_snapshot: dict[str, Any] | None = None
         self._snapshot_requested = Event()
         self._snapshot_ready = Event()
         self._snapshot_error: BaseException | None = None
+        self.last_words_request: Callable[[str], None] | None = None
+        self.last_words_stop_requested: Callable[[], bool] | None = None
+        self.last_words_restore_incomplete = False
+        self._last_words_initial_sync_complete = False
+        self.elastic_enabled = True
 
     def _begin_step(self):
         self.commit_authorized = False
+        self.commit_decided = False
+        self.commit_unknown = False
         if self._quorum_future is not None and not self._quorum_future.done():
             # A late healing request must finish before the snapshot events reset.
             self.wait_quorum()
@@ -115,11 +154,34 @@ class ManagerEx(Manager):
             if self._group_world_size > 1:
                 dist.barrier()
             self._initial_quorum_barrier_pending = False
-        self.start_quorum()
+        if getattr(self, "elastic_enabled", True) and getattr(self, "last_words_request", None) is None:
+            self.start_quorum()
+        else:
+            self.start_quorum(
+                allow_heal=getattr(self, "elastic_enabled", False) or not self._last_words_initial_sync_complete
+            )
+        self._last_words_initial_sync_complete = True
 
     def wait_quorum(self):
         assert self._quorum_future is not None
         while not self._quorum_future.done():
+            stop_requested = getattr(self, "last_words_stop_requested", None)
+            if not getattr(self, "elastic_enabled", True) and stop_requested is not None and stop_requested():
+                error = TorchFTQuorumStoppedError("last words stop requested while waiting for quorum")
+                if (
+                    not self._last_words_initial_sync_complete
+                    or self._pending_state_dict is not None
+                    or self._recovery_event is not None
+                    or self.last_words_restore_incomplete
+                    or self.commit_unknown
+                    or self.commit_authorized
+                ):
+                    self.last_words_restore_incomplete = True
+                # Unblock any snapshot requester without exporting state after
+                # terminal stop. A late PG configure is fenced independently.
+                self._snapshot_error = error
+                self._snapshot_ready.set()
+                raise error
             if self._snapshot_requested.wait(0.01) and not self._snapshot_ready.is_set():
                 try:
                     self._healing_snapshot = self._export_snapshot()
@@ -130,12 +192,19 @@ class ManagerEx(Manager):
         return super().wait_quorum()
 
     def should_commit(self, timeout=None):
+        if getattr(self, "commit_decided", False):
+            raise RuntimeError("TorchFT commit may only be voted once per attempt")
+        self.commit_decided = True
         try:
             accepted = super().should_commit(timeout)
         except TimeoutError as error:
+            self.commit_unknown = True
             self.report_error(error)
             self._checkpoint_transport.disallow_checkpoint()
             raise TorchFTCommitTimeoutError("TorchFT commit RPC timed out; restart the entire replica") from error
+        except BaseException:
+            self.commit_unknown = True
+            raise
         self.commit_authorized = accepted
         return accepted
 
@@ -147,7 +216,18 @@ class ManagerEx(Manager):
         self._recovery_event = None
         self.report_error(error)
         try:
-            if self.should_commit():
+            if getattr(self, "commit_unknown", False):
+                raise TorchFTCommitTimeoutError("Cannot discard an attempt with an unknown commit result") from error
+            future = getattr(self, "_quorum_future", None)
+            if future is None or (future.done() and future.exception() is not None):
+                # No commit RPC can have been issued for a failed quorum future.
+                # Asking should_commit would rethrow that failure before voting.
+                self.commit_decided = True
+                self._commit_failures += 1
+                self._checkpoint_transport.disallow_checkpoint()
+                self._quorum_future = None
+                return
+            if not getattr(self, "commit_decided", False) and self.should_commit():
                 raise RuntimeError("An interrupted TorchFT attempt was unexpectedly authorized") from error
         finally:
             # Rebuild a destroyed communicator even if membership is unchanged.
@@ -159,11 +239,49 @@ class ManagerEx(Manager):
             "torchft": self.state_dict(),
         }
 
+    def quorum_members(self):
+        if self.errored() is not None or self._pg._get_process_group() is None:
+            raise RuntimeError("TorchFT quorum is not usable at the training boundary")
+        ranks = self._pg._global_ranks
+        if (
+            not ranks
+            or self._group_world_size <= 0
+            or any(
+                type(rank) is not int or rank < 0 or rank % self._group_world_size != self._group_rank for rank in ranks
+            )
+        ):
+            raise RuntimeError("TorchFT quorum has no valid logical replica mapping")
+        members = sorted(rank // self._group_world_size for rank in ranks)
+        if len(set(members)) != len(members) or len(members) != self.num_participants():
+            raise RuntimeError("TorchFT quorum membership and participant count disagree")
+        return members
+
     def _apply_pending_state_dict(self):
+        if (
+            getattr(self, "last_words_request", None) is not None
+            and not getattr(self, "elastic_enabled", False)
+            and self._last_words_initial_sync_complete
+            and self._pending_state_dict is not None
+        ):
+            request = self.last_words_request
+            assert request is not None
+            request("Runtime replica healing is unsupported with last words")
+            raise RuntimeError("Runtime replica healing is unsupported with last words")
         if self._recovery_event is not None:
             self._recovery_event.synchronize()
             self._recovery_event = None
+        received_state = self._pending_state_dict is not None
+        if getattr(self, "last_words_request", None) is not None:
+            # Keep this latched on any partial tensor/state restoration failure.
+            self.last_words_restore_incomplete = True
         super()._apply_pending_state_dict()
+        if getattr(self, "last_words_request", None) is not None:
+            if not received_state:
+                raise RuntimeError("Healing did not provide a complete checkpoint; replica is ineligible")
+            if self.last_words_restore_incomplete:
+                torch_npu.npu.synchronize()
+            self.last_words_restore_incomplete = False
+            self._last_words_initial_sync_complete = True
 
     def register_state_dict_fn(self, key, load_state_dict, state_dict):
         def load_from_cpu(snapshot):
