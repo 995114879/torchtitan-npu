@@ -287,16 +287,17 @@ torchtitan-npu/
 
 System: Ascend 950，图模式
 
-| 模型 | NPU 数 | 量化 | GBS | 序列长度 | FSDP | TP | PP | CP | EP | 单卡吞吐 (tokens/s) | step time | BF16 MFU |
+| 模型 | NPU 数 | 量化 | GBS | 序列长度 | FSDP | TP | PP | CP | EP | 单卡吞吐 (tokens/s) | step time | BF16 MFU 估算上限¹ |
 | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | MXFP8 | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 2126 | 15.42 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | MXFP8 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1501.6 | 43.64 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 128 | MXFP8 | 8 | 1M | 1 | 1 | 1 | 128 | 128 | 1325 | 49.46 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | BF16 | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1603 | 20.44 s | 28.81% |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | BF16 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1421 | 46.12 s | 32.87% |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1576 | 20.79 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1532 | 42.78 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | MXFP8 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 2141 | 30.61 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 128 | BF16 | 8 | 1M | 1 | 1 | 1 | 128 | 128 | 1524 | 42.99 s | 57.7% |
+| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | BF16 | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1815 | 18.05 s | 35.9% |
+| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | BF16 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1826 | 35.89 s | 38.5% |
+| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 2127 | 15.41 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 2139 | 30.63 s | / |
 
+¹ BF16 MFU 在 [TorchTitan MFU 计算公式](https://github.com/pytorch/torchtitan/blob/086bf6c166ec85c1298eb5596fa9bf95f6a2d840/torchtitan/components/metrics.py#L475-L489)的基础上进行修正，注意力按文档内因果可见的滑窗、HCA 压缩前缀及 CSA 选中项计数。Indexer 前向按可见候选计数，Q/K 梯度按选中的 top-k 计数。表中按每条序列只有一个文档段估算上限，Packed 数据按文档段分别累加。
 
 # 免责声明
 
