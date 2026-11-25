@@ -123,6 +123,8 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
 
     compute_sharding_by_fqn: dict[str, ComputeLayout] = {}
     bucket_configs: list[BucketConfig] = []
+    common_patterns: list[str] = []
+    routed_patterns: list[str] = []
     for layer_id, layer_config in enumerate(model_config.layers):
         attention = layer_config.attention
         attention_shardings = {
@@ -168,16 +170,19 @@ def _v41_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
                         shardings[f"{owner}.lora_b.weight"] = layout
             for projection in ("w13_lora_a", "w1_lora_b", "w3_lora_b", "w2_lora_a", "w2_lora_b"):
                 routed_shardings[f"layers.{layer_id}.moe.routed_experts.inner_experts.{projection}"] = expert_sharding
-        # Split each layer into three buckets: the routed-expert GEMMs are
-        # by far the largest and get a bucket of their own so the
-        # Newton-Schulz all-gather peak stays bounded on the 40-layer
-        # FSDP8 shape (a single per-layer bucket OOMs at ~89% HBM).
         compute_sharding_by_fqn.update(attention_shardings)
         compute_sharding_by_fqn.update(dense_shardings)
         compute_sharding_by_fqn.update(routed_shardings)
-        bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.attn", patterns=tuple(attention_shardings)))
-        bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.dense", patterns=tuple(dense_shardings)))
-        bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.routed", patterns=tuple(routed_shardings)))
+        common_patterns.extend((*attention_shardings, *dense_shardings))
+        routed_patterns.extend(routed_shardings)
+        # Pair layers to expose more independent Owned work, but keep routed
+        # experts separate to bound redistribution buffers.
+        if layer_id % 2 == 1 or layer_id == len(model_config.layers) - 1:
+            name = f"layers.{layer_id - layer_id % 2}-{layer_id}"
+            bucket_configs.append(BucketConfig(name=f"{name}.common", patterns=tuple(common_patterns)))
+            bucket_configs.append(BucketConfig(name=f"{name}.routed", patterns=tuple(routed_patterns)))
+            common_patterns.clear()
+            routed_patterns.clear()
 
     lora_pattern = ""
     if getattr(model_config, "lora", None) is not None:
