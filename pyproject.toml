@@ -18,6 +18,7 @@ multimodal = [
 ]
 torchft = [
     "torchft==0.2.0",
+    "psutil",
 ]
 
 [tool.setuptools.packages.find]

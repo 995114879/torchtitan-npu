@@ -1,0 +1,619 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 63fa9734002daccc0892047457b235697e279aa5..aa8919eb8fb165cbf31e4bca36937f6e3b520cc1 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -2,3 +2,3 @@
+ name = "torchft"
+-version = "0.2.0"
++version = "0.2.0+preempt.1"
+ edition = "2021"
+@@ -6,2 +6,4 @@ edition = "2021"
+ [dependencies]
++serde = {version = "1", features = ["derive"]}
++serde_json = "1"
+ anyhow = "1.0.89"
+diff --git a/proto/torchft.proto b/proto/torchft.proto
+index 12fce2868a3d35776bebc4fa683918819d0c2a09..78d87ebf7a50ab47958480973aebf47e83141e59 100644
+--- a/proto/torchft.proto
++++ b/proto/torchft.proto
+@@ -118,6 +118,8 @@ message ShouldCommitResponse {
+
+ message KillRequest {
+   string msg = 1;
++  // Empty for dashboard requests. Planned Kill only applies to this incarnation.
++  string instance_id = 2;
+ }
+ message KillResponse {}
+
+diff --git a/src/lighthouse/preemption.rs b/src/lighthouse/preemption.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1be269027703b087944e6611df8dcff0a07c525
+--- /dev/null
++++ b/src/lighthouse/preemption.rs
+@@ -0,0 +1,404 @@
++// Copyright (c) 2026 Huawei Technologies Co., Ltd.
++// This source code is licensed under the BSD-style license found in LICENSE.
++
++use super::*;
++use axum::http::HeaderMap;
++use axum::Json;
++use serde::{Deserialize, Serialize};
++use std::collections::{BTreeMap, BTreeSet};
++
++type Layout = BTreeMap<String, BTreeMap<String, Vec<u32>>>;
++type Instances = BTreeMap<String, String>;
++
++pub(super) struct Preemption {
++    layout: Layout,
++    token: String,
++    lease: Option<Lease>,
++    used_requests: HashSet<String>,
++    retired: HashSet<String>,
++    timeout: Duration,
++}
++
++#[derive(Clone, Copy, PartialEq, Serialize, Debug)]
++#[serde(rename_all = "snake_case")]
++enum Phase {
++    Preparing,
++    Draining,
++    DrainTimedOut,
++    Released,
++    Joining,
++    JoinTimedOut,
++    Restored,
++    Cancelled,
++}
++
++#[derive(Serialize)]
++struct Lease {
++    request: String,
++    cards: usize,
++    node: Option<String>,
++    phase: Phase,
++    targets: Instances,
++    incumbents: Instances,
++    manager_exits: BTreeSet<String>,
++    receipts: BTreeSet<(String, String)>,
++    #[serde(skip)]
++    since: Instant,
++    reason: Option<&'static str>,
++    #[serde(skip)]
++    pending_kills: BTreeMap<String, QuorumMember>,
++    #[serde(skip)]
++    kill_attempts: u32,
++    #[serde(skip)]
++    next_kill: Instant,
++}
++
++#[derive(Deserialize)]
++#[serde(tag = "action", rename_all = "snake_case")]
++pub(super) enum Command {
++    Status,
++    Suspend { request: String, cards: usize, node: Option<String> },
++    ManagerExited { request: String, slot: String, instance: String },
++    Released { request: String, slot: String, instance: String, node: String },
++    Resume { request: String },
++    Retry { request: String },
++    Cancel { request: String },
++}
++
++// Manager appends a fresh UUID to its configured replica name at every launch.
++fn slot(instance: &str) -> &str {
++    instance.rsplit_once(':').map_or(instance, |(name, _)| name)
++}
++
++impl Preemption {
++    pub(super) fn from_env() -> Result<Option<Self>> {
++        let Some(path) = std::env::var_os("TORCHFT_PREEMPT_LAYOUT") else {
++            return Ok(None);
++        };
++        let layout: Layout = serde_json::from_slice(&std::fs::read(path)?)?;
++        let token = std::env::var("TORCHFT_PREEMPT_TOKEN")?;
++        anyhow::ensure!(!token.is_empty() && !layout.is_empty(), "empty token or layout");
++        let mut devices = BTreeSet::new();
++        for (name, nodes) in &layout {
++            anyhow::ensure!(!name.is_empty() && !nodes.is_empty(), "empty replica placement");
++            for (node, cards) in nodes {
++                anyhow::ensure!(!node.is_empty() && !cards.is_empty(), "empty node placement");
++                for card in cards {
++                    anyhow::ensure!(devices.insert((node, card)), "device assigned twice");
++                }
++            }
++        }
++        let seconds = match std::env::var("TORCHFT_PREEMPT_TIMEOUT_SECONDS") {
++            Ok(value) => value.parse::<u64>()?,
++            Err(std::env::VarError::NotPresent) => 600,
++            Err(error) => return Err(error.into()),
++        };
++        anyhow::ensure!(seconds > 0, "TORCHFT_PREEMPT_TIMEOUT_SECONDS must be positive");
++        Ok(Some(Self {
++            timeout: Duration::from_secs(seconds),
++            layout, token, lease: None,
++            retired: HashSet::new(),
++            used_requests: HashSet::new(),
++        }))
++    }
++
++    pub(super) fn excluded(&self, id: &str) -> bool {
++        self.retired.contains(id) || self.lease.as_ref().is_some_and(|lease| {
++            matches!(lease.phase, Phase::Released | Phase::Draining | Phase::DrainTimedOut)
++                && lease.targets.contains_key(slot(id))
++        })
++    }
++
++    fn suspend(&mut self, request: String, cards: usize, node: Option<String>, quorum: Option<&Quorum>, minimum: usize) -> Result<()> {
++        anyhow::ensure!(!request.is_empty() && cards > 0, "specify a request and positive card count");
++        if let Some(lease) = &self.lease {
++            if lease.request == request {
++                anyhow::ensure!(lease.cards == cards && lease.node == node, "request parameters changed");
++                return Ok(());
++            }
++            anyhow::ensure!(matches!(lease.phase, Phase::Restored | Phase::Cancelled), "another membership change is active");
++        }
++        let quorum = quorum.ok_or_else(|| anyhow!("no published quorum"))?;
++        let incumbents: Instances = quorum.participants.iter()
++            .map(|m| (slot(&m.replica_id).to_owned(), m.replica_id.clone())).collect();
++        anyhow::ensure!(incumbents.len() == quorum.participants.len() && incumbents.keys().eq(self.layout.keys()),
++            "wait for configured replicas to join");
++
++        // Count only cards in the requested location. Releasing the largest
++        // contributors first minimizes the number of whole replicas stopped.
++        let mut choices = Vec::new();
++        for (name, nodes) in &self.layout {
++            let count: usize = nodes.iter()
++                .filter(|(n, _)| node.as_ref().map_or(true, |wanted| wanted == *n))
++                .map(|(_, devices)| devices.len()).sum();
++            if count > 0 {
++                choices.push((count, name));
++            }
++        }
++        choices.sort_by(|a, b| b.cmp(a));
++        let mut count = 0;
++        let mut targets = Instances::new();
++        for (n, name) in choices.into_iter().take(incumbents.len().saturating_sub(minimum.max(1))) {
++            targets.insert(name.clone(), incumbents[name].clone());
++            count += n;
++            if count >= cards {
++                break;
++            }
++        }
++        anyhow::ensure!(count >= cards, "insufficient releasable cards");
++        anyhow::ensure!(self.used_requests.insert(request.clone()), "request ID has already completed");
++        self.lease = Some(Lease {
++            request, cards, node, targets, incumbents, phase: Phase::Preparing,
++            manager_exits: BTreeSet::new(), receipts: BTreeSet::new(), since: Instant::now(),
++            reason: None, pending_kills: BTreeMap::new(), kill_attempts: 0, next_kill: Instant::now(),
++        });
++        Ok(())
++    }
++
++    fn command(&mut self, cmd: Command, quorum: Option<&Quorum>, minimum: usize) -> Result<()> {
++        match cmd {
++            Command::Status => (),
++            Command::Suspend { request, cards, node } => return self.suspend(request, cards, node, quorum, minimum),
++            Command::ManagerExited { request, slot, instance } => {
++                let lease = self.target(&request, &slot, &instance)?;
++                lease.pending_kills.remove(&slot);
++                lease.manager_exits.insert(slot);
++            }
++            Command::Released { request, slot, instance, node } => {
++                anyhow::ensure!(self.layout.get(&slot).is_some_and(|nodes| nodes.contains_key(&node)), "unknown node");
++                let lease = self.target(&request, &slot, &instance)?;
++                anyhow::ensure!(lease.manager_exits.contains(&slot), "native Manager exit not confirmed");
++                lease.receipts.insert((slot, node));
++                let lease = self.lease.as_mut().unwrap();
++                let all_released = lease.targets.keys().all(|name| self.layout[name].keys().all(|n|
++                    lease.receipts.contains(&(name.clone(), n.clone()))));
++                if all_released && matches!(lease.phase, Phase::Draining | Phase::DrainTimedOut) {
++                    lease.phase = Phase::Released;
++                    lease.reason = None;
++                }
++            }
++            Command::Resume { request } => {
++                let lease = self.lease.as_mut().ok_or_else(|| anyhow!("no lease"))?;
++                anyhow::ensure!(lease.request == request && matches!(lease.phase, Phase::Released | Phase::Joining | Phase::JoinTimedOut | Phase::Restored),
++                    "request is not released");
++                if lease.phase == Phase::Released {
++                    lease.phase = Phase::Joining;
++                    lease.since = Instant::now();
++                }
++            }
++            Command::Retry { request } => {
++                let lease = self.lease.as_mut().ok_or_else(|| anyhow!("no lease"))?;
++                anyhow::ensure!(lease.request == request && lease.phase == Phase::DrainTimedOut,
++                    "retry requires the timed-out draining request");
++                lease.phase = Phase::Draining;
++                lease.reason = None;
++                lease.since = Instant::now();
++                lease.next_kill = lease.since;
++                lease.kill_attempts = 0;
++            }
++            Command::Cancel { request } => {
++                let lease = self.lease.as_mut().ok_or_else(|| anyhow!("no lease"))?;
++                anyhow::ensure!(lease.request == request && matches!(lease.phase,
++                    Phase::Preparing | Phase::Joining | Phase::JoinTimedOut | Phase::Cancelled),
++                    "cancel is allowed before Kill or after the devices have been returned");
++                lease.phase = Phase::Cancelled;
++                lease.reason = Some("cancelled by operator");
++            }
++        }
++        Ok(())
++    }
++
++    fn target(&mut self, request: &str, name: &str, id: &str) -> Result<&mut Lease> {
++        let lease = self.lease.as_mut().ok_or_else(|| anyhow!("no lease"))?;
++        anyhow::ensure!(lease.request == request && lease.targets.get(name).is_some_and(|v| v == id)
++            && (matches!(lease.phase, Phase::Draining | Phase::DrainTimedOut | Phase::Released)
++                || lease.manager_exits.contains(name)), "stale release acknowledgement");
++        Ok(lease)
++    }
++
++    // New RPCs and periodic ticks take the same lock. Once all incumbents are
++    // waiting here, no old member can start training with a stale quorum.
++    pub(super) fn before_tick(&mut self, participants: &mut HashMap<String, QuorumMemberDetails>,
++        heartbeats: &mut HashMap<String, Instant>, heartbeat_timeout: Duration) -> bool {
++        let Some(lease) = self.lease.as_mut() else { return true };
++        match lease.phase {
++            Phase::Preparing => {
++                if lease.since.elapsed() >= self.timeout {
++                    lease.phase = Phase::Cancelled;
++                    lease.reason = Some("timed out waiting for incumbents to reach quorum");
++                    return true;
++                }
++                if !lease.incumbents.values().all(|id| participants.contains_key(id)
++                    && heartbeats.get(id).is_some_and(|last| last.elapsed() < heartbeat_timeout)) {
++                    return false;
++                }
++                if participants.len() != lease.incumbents.len() {
++                    lease.phase = Phase::Cancelled;
++                    lease.reason = Some("membership changed before shrink");
++                    return true;
++                }
++                lease.phase = Phase::Draining;
++                lease.since = Instant::now();
++                for id in lease.targets.values() {
++                    let member = participants.remove(id).unwrap().member;
++                    heartbeats.remove(id);
++                    self.retired.insert(id.clone());
++                    // Capture the address before replacing prev_quorum. Network I/O
++                    // runs outside the state lock; only launcher receipts release cards.
++                    lease.pending_kills.insert(slot(id).to_owned(), member);
++                }
++            }
++            Phase::Draining if lease.since.elapsed() >= self.timeout => {
++                lease.phase = Phase::DrainTimedOut;
++                lease.reason = Some("waiting for Manager exit or node release receipts");
++            }
++            Phase::Joining if lease.since.elapsed() >= self.timeout => {
++                lease.phase = Phase::JoinTimedOut;
++                lease.reason = Some("waiting for returning replicas and a recovery source");
++            }
++            _ => (),
++        }
++        if lease.phase == Phase::Draining && lease.kill_attempts < 4 && Instant::now() >= lease.next_kill {
++            for member in lease.pending_kills.values() {
++                tokio::spawn(kill_instance(member.clone()));
++            }
++            lease.kill_attempts += 1;
++            lease.next_kill = Instant::now() + Duration::from_secs(12 * u64::from(lease.kill_attempts));
++        }
++        true
++    }
++
++    pub(super) fn can_publish(&self, candidates: &[QuorumMember], previous: Option<&Quorum>) -> bool {
++        let Some(lease) = &self.lease else { return true };
++        if !matches!(lease.phase, Phase::Joining | Phase::JoinTimedOut | Phase::Cancelled)
++            || lease.manager_exits.is_empty()
++            || !candidates.iter().any(|m| lease.targets.contains_key(slot(&m.replica_id))) {
++            return true;
++        }
++        // A returning step-zero Manager must not bootstrap over the survivor's state.
++        // One source at the latest advertised step suffices; other old IDs may be gone.
++        previous.is_some_and(|q| {
++            let latest = q.participants.iter().map(|m| m.step).max().unwrap_or(0);
++            candidates.iter().any(|m| m.step > latest || (m.step == latest
++                && (latest > 0 || q.participants.iter().any(|old| old.replica_id == m.replica_id))))
++        })
++    }
++
++    pub(super) fn published(&mut self, quorum: &Quorum) {
++        if let Some(lease) = &mut self.lease {
++            if matches!(lease.phase, Phase::Joining | Phase::JoinTimedOut) && lease.targets.keys().all(|name|
++                quorum.participants.iter().any(|m| slot(&m.replica_id) == name)) {
++                lease.phase = Phase::Restored;
++                lease.reason = None;
++            }
++        }
++    }
++}
++
++async fn kill_instance(member: QuorumMember) {
++    let result = async {
++        let mut client = manager_client_new(member.address, Duration::from_secs(10)).await?;
++        tokio::time::timeout(Duration::from_secs(10), client.kill(Request::new(KillRequest {
++            msg: "suspended by Lighthouse".into(), instance_id: member.replica_id.clone(),
++        }))).await??;
++        Ok::<_, anyhow::Error>(())
++    }.await;
++    // Kill exits inside the RPC, so even successful delivery can return EOF.
++    info!("planned Kill {}: {:?}; waiting for node acknowledgement", member.replica_id, result);
++}
++
++pub(super) async fn control(lh: Arc<Lighthouse>, headers: HeaderMap, Json(cmd): Json<Command>) -> impl IntoResponse {
++    let mut state = lh.state.lock().await;
++    let State { preemption, prev_quorum, .. } = &mut *state;
++    let Some(p) = preemption else {
++        return (StatusCode::NOT_FOUND, "preemption disabled".to_owned());
++    };
++    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(&format!("Bearer {}", p.token)) {
++        return (StatusCode::UNAUTHORIZED, "invalid token".to_owned());
++    }
++    if let Err(error) = p.command(cmd, prev_quorum.as_ref(), lh.opt.min_replicas as usize) {
++        return (StatusCode::CONFLICT, error.to_string());
++    }
++    let members = prev_quorum.as_ref().map(|q| q.participants.iter()
++        .map(|m| (&m.replica_id, m.step)).collect::<BTreeMap<_, _>>());
++    let mut missing_receipts = Vec::new();
++    if let Some(lease) = &p.lease {
++        if lease.phase == Phase::DrainTimedOut {
++            for name in lease.targets.keys() {
++                for node in p.layout[name].keys() {
++                    if !lease.receipts.contains(&(name.clone(), node.clone())) {
++                        missing_receipts.push((name, node));
++                    }
++                }
++            }
++        }
++    }
++    (StatusCode::OK, serde_json::json!({"lease":p.lease,"layout":p.layout,"quorum":members,
++        "missing_receipts":missing_receipts}).to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn suspend(request: &str, cards: usize) -> Command {
++        Command::Suspend { request: request.into(), cards, node: Some("west".into()) }
++    }
++
++    #[tokio::test]
++    async fn planned_shrink_waits_for_the_round_and_all_node_receipts() -> Result<()> {
++        let layout = serde_json::from_str(r#"{"a":{"east":[2]},"b":{"west":[0,1],"east":[0,1]},"c":{"west":[2]}}"#)?;
++        let mut p = Preemption {layout, token:"test".into(), lease:None, retired:Default::default(), used_requests:Default::default(), timeout:Duration::from_secs(600)};
++        let members: Vec<_> = ["a:one","b:one","c:one"].iter().map(|id|QuorumMember{
++            replica_id:id.to_string(), address:"http://127.0.0.1:1".into(), ..Default::default()
++        }).collect();
++        let q = Quorum{participants:members.clone(), ..Default::default()};
++        assert!(p.command(suspend("too-many",3),Some(&q),2).is_err());
++        p.command(suspend("job",2),Some(&q),2)?;
++        let mut participants = HashMap::new();
++        let mut beats = HashMap::new();
++        let now=Instant::now();
++        for (i, mut member) in members.into_iter().enumerate() {
++            member.step=i as i64;
++            beats.insert(member.replica_id.clone(),now);
++            participants.insert(member.replica_id.clone(),QuorumMemberDetails{member,joined:now});
++            assert_eq!(p.before_tick(&mut participants,&mut beats,Duration::from_secs(5)),i==2);
++        }
++        assert!(p.excluded("b:one"));
++        assert_eq!(participants.len(),2);
++        assert!(!beats.contains_key("b:one"));
++        let resume=||Command::Resume{request:"job".into()};
++        assert!(p.command(resume(),Some(&q),2).is_err());
++        p.lease.as_mut().unwrap().since -= p.timeout;
++        assert!(p.before_tick(&mut participants,&mut beats,Duration::from_secs(5)));
++        assert_eq!(p.lease.as_ref().unwrap().phase,Phase::DrainTimedOut);
++        assert!(p.excluded("b:restart"));
++        assert!(p.command(Command::Cancel {request:"job".into()},Some(&q),2).is_err());
++        p.command(Command::Retry {request:"job".into()},Some(&q),2)?;
++        assert!(p.before_tick(&mut participants,&mut beats,Duration::from_secs(5)));
++        assert_eq!(p.lease.as_ref().unwrap().kill_attempts,1);
++        p.command(Command::ManagerExited{request:"job".into(),slot:"b".into(),instance:"b:one".into()},Some(&q),2)?;
++        for (node,phase) in [("west",Phase::Draining),("east",Phase::Released)] {
++            p.command(Command::Released{request:"job".into(),slot:"b".into(),instance:"b:one".into(),node:node.into()},Some(&q),2)?;
++            assert_eq!(p.lease.as_ref().unwrap().phase,phase);
++        }
++        p.command(resume(),Some(&q),2)?;
++        assert!(p.excluded("b:one"));
++        assert!(!p.excluded("b:two"));
++        let member = |id: &str, step| QuorumMember { replica_id:id.into(), step, ..Default::default() };
++        let previous = Quorum { participants:vec![member("a:one",49), member("c:one",49)], ..Default::default() };
++        let returning = member("b:two",0);
++        assert!(!p.can_publish(std::slice::from_ref(&returning),Some(&previous)));
++        let ready = vec![member("a:one",50), returning];
++        assert!(p.can_publish(&ready,Some(&previous)));
++        p.lease.as_mut().unwrap().since -= p.timeout;
++        p.before_tick(&mut participants,&mut beats,Duration::from_secs(5));
++        assert_eq!(p.lease.as_ref().unwrap().phase,Phase::JoinTimedOut);
++        p.published(&Quorum { participants:ready, ..Default::default() });
++        assert_eq!(p.lease.as_ref().unwrap().phase,Phase::Restored);
++        // A lost HTTP response can cause a late duplicate after resume.
++        p.command(Command::Released{request:"job".into(),slot:"b".into(),instance:"b:one".into(),node:"east".into()},Some(&q),2)?;
++        assert_eq!(p.lease.as_ref().unwrap().phase,Phase::Restored);
++        Ok(())
++    }
++}
+diff --git a/src/lighthouse.rs b/src/lighthouse.rs
+index ea1aa3f96c93661724afa56f5a0253e96bfd21ec..2ef117276c8d510bb70ca4d31dd8630b44123568 100644
+--- a/src/lighthouse.rs
++++ b/src/lighthouse.rs
+@@ -4,6 +4,9 @@
+ // This source code is licensed under the BSD-style license found in the
+ // LICENSE file in the root directory of this source tree.
+
++mod preemption;
++use preemption::Preemption;
++
+ use core::net::SocketAddr;
+ use std::collections::HashMap;
+ use std::collections::HashSet;
+@@ -55,6 +58,7 @@ struct QuorumMemberDetails {
+ }
+
+ struct State {
++    preemption: Option<Preemption>,
+     channel: broadcast::Sender<Quorum>,
+     participants: HashMap<String, QuorumMemberDetails>,
+     prev_quorum: Option<Quorum>,
+@@ -281,6 +285,7 @@ impl Lighthouse {
+                 prev_quorum: None,
+                 quorum_id: 0,
+                 heartbeats: HashMap::new(),
++                preemption: Preemption::from_env()?,
+             }),
+             opt,
+             local_addr: listener.local_addr()?,
+@@ -290,11 +295,25 @@ impl Lighthouse {
+     }
+
+     fn _quorum_tick(self: Arc<Self>, state: &mut State) -> Result<()> {
++        if let Some(p) = state.preemption.as_mut() {
++            if !p.before_tick(
++                &mut state.participants,
++                &mut state.heartbeats,
++                Duration::from_millis(self.opt.heartbeat_timeout_ms),
++            ) {
++                return Ok(());
++            }
++        }
+         let (quorum_met, reason) = quorum_compute(Instant::now(), state, &self.opt);
+         self.change_logger.log_if_changed(&reason);
+
+         if quorum_met.is_some() {
+             let participants = quorum_met.unwrap();
++            if let Some(p) = &state.preemption {
++                if !p.can_publish(&participants, state.prev_quorum.as_ref()) {
++                    return Ok(());
++                }
++            }
+
+             let commit_failure_replica_ids: Vec<String> = participants
+                 .iter()
+@@ -332,6 +351,9 @@ impl Lighthouse {
+
+             info!("Quorum! {:?}", quorum);
+
++            if let Some(p) = state.preemption.as_mut() {
++                p.published(&quorum);
++            }
+             state.prev_quorum = Some(quorum.clone());
+             state.participants.clear();
+             match state.channel.send(quorum) {
+@@ -368,6 +390,10 @@ impl Lighthouse {
+
+         // Setup HTTP endpoints
+         let app = Router::new()
++            .route("/preemption", post({
++                let lh = self.clone();
++                move |headers, cmd| preemption::control(lh, headers, cmd)
++            }))
+             .route(
+                 "/",
+                 get(|| async { Html(IndexTemplate {}.render().unwrap()) }),
+@@ -472,6 +498,7 @@ impl Lighthouse {
+
+         let request = tonic::Request::new(KillRequest {
+             msg: "killed from dashboard".to_string(),
++            instance_id: replica_id,
+         });
+         let _resp = client.kill(request).await?;
+
+@@ -498,6 +525,9 @@ impl LighthouseService for Arc<Lighthouse> {
+         let mut rx = {
+             let mut state = self.state.lock().await;
+
++            if state.preemption.as_ref().is_some_and(|p| p.excluded(&requester.replica_id)) {
++                return Err(Status::failed_precondition("suspended instance"));
++            }
+             // implicit heartbeat
+             state
+                 .heartbeats
+@@ -533,6 +563,9 @@ impl LighthouseService for Arc<Lighthouse> {
+
+             // Only continue the loop if the replica is not in the quorum
+             let mut state = self.state.lock().await;
++            if state.preemption.as_ref().is_some_and(|p| p.excluded(&requester.replica_id)) {
++                return Err(Status::failed_precondition("suspended instance"));
++            }
+             state.participants.insert(
+                 requester.replica_id.clone(),
+                 QuorumMemberDetails {
+@@ -558,7 +591,9 @@ impl LighthouseService for Arc<Lighthouse> {
+
+         {
+             let mut state = self.state.lock().await;
+-            state.heartbeats.insert(replica_id, Instant::now());
++            if !state.preemption.as_ref().is_some_and(|p| p.excluded(&replica_id)) {
++                state.heartbeats.insert(replica_id, Instant::now());
++            }
+         }
+
+         let reply = LighthouseHeartbeatResponse {};
+@@ -640,6 +675,7 @@ mod tests {
+             prev_quorum: None,
+             quorum_id: 0,
+             heartbeats: HashMap::new(),
++            preemption: None,
+         };
+
+         let now = Instant::now();
+@@ -719,6 +755,7 @@ mod tests {
+             prev_quorum: None,
+             quorum_id: 0,
+             heartbeats: HashMap::new(),
++            preemption: None,
+         };
+
+         let now = Instant::now();
+@@ -805,6 +842,7 @@ mod tests {
+             prev_quorum: None,
+             quorum_id: 0,
+             heartbeats: HashMap::new(),
++            preemption: None,
+         };
+
+         let now = Instant::now();
+@@ -895,6 +933,7 @@ mod tests {
+             prev_quorum: None,
+             quorum_id: 0,
+             heartbeats: HashMap::new(),
++            preemption: None,
+         };
+
+         let now = Instant::now();
+@@ -1036,6 +1075,7 @@ mod tests {
+             prev_quorum: None,
+             quorum_id: 0,
+             heartbeats: HashMap::new(),
++            preemption: None,
+         };
+
+         let now = Instant::now();
+diff --git a/src/manager.rs b/src/manager.rs
+index 816e06abb4a52726b990971dc73e2d9ddf8748ce..8dd994aa72295c4bf840cbabcaa03fb9ac756f8a 100644
+--- a/src/manager.rs
++++ b/src/manager.rs
+@@ -480,6 +480,9 @@ impl ManagerService for Arc<Manager> {
+
+     async fn kill(&self, request: Request<KillRequest>) -> Result<Response<KillResponse>, Status> {
+         let req = request.into_inner();
++        if !req.instance_id.is_empty() && req.instance_id != self.replica_id {
++            return Err(Status::failed_precondition("Kill addressed to another instance"));
++        }
+
+         warn!("got kill request: {}", req.msg);
+         std::process::exit(1);
+@@ -677,6 +680,11 @@ mod tests {
+             0,                          // quorum retries
+         )
+         .await?;
++        let stale_kill = Request::new(KillRequest {
++            msg: "planned kill with stale address".into(),
++            instance_id: "rep_id:old".into(),
++        });
++        assert_eq!(manager.kill(stale_kill).await.unwrap_err().code(), tonic::Code::FailedPrecondition);
+         let manager_fut = tokio::spawn(manager._run_grpc());
+
+         let fut_a = tokio::spawn(should_commit(0, true));

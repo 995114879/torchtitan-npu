@@ -55,7 +55,7 @@ pip install --no-deps -e "${TORCHTITAN_DIR}"
 pip install \
     --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torchft/index.html \
     "torch==$(python -c 'import torch; print(torch.__version__.split("+")[0])')" \
-    'torchft==0.2.0'
+    'torchft==0.2.0' psutil
 pip install --no-deps -e .
 
 # The image predates wheels added to requirements.txt.  Install only those wheels:

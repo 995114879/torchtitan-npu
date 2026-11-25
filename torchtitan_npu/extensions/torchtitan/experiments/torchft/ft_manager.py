@@ -16,6 +16,7 @@ import torchft
 from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 from torchtitan.experiments.torchft.manager import TorchFTManager
 
+from torchtitan_npu.extensions.torchtitan.experiments.torchft import preempt
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.last_words.worker import LastWordsConfig
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
@@ -63,6 +64,8 @@ class FTManagerEx(TorchFTManager):
     @dataclass(kw_only=True, slots=True)
     class Config(TorchFTManager.Config):
         enable: bool = True
+        enable_preemption: bool = False
+        """Enable Lighthouse planned preemption for workers started by the node launcher."""
         process_group: str = "hccl"
         quorum_timeout_seconds: int = 60
         """Allow time for replica-local state export, loading and disk operations."""
@@ -86,11 +89,14 @@ class FTManagerEx(TorchFTManager):
             raise ValueError("NPU TorchFT requires at least two elastic DP replicas")
         if not 1 <= config.min_replica_size <= config.group_size:
             raise ValueError("min_replica_size must be between 1 and group_size")
+        if config.enable_preemption and config.min_replica_size == config.group_size:
+            raise ValueError("Planned preemption requires min_replica_size < group_size")
         if not 0 <= config.replica_id < config.group_size:
             raise ValueError("replica_id must be between 0 and group_size - 1")
 
     def __init__(self, config: Config) -> None:
         self.validate_config(config)
+        worker_dir = preempt.worker_directory(config.replica_id) if config.enable_preemption else None
         self.group_size = config.group_size
         self.replica_id = config.replica_id
         # Required by TorchTitan's optimizer container interface. Quorum
@@ -118,6 +124,8 @@ class FTManagerEx(TorchFTManager):
             quorum_timeout=timedelta(seconds=config.quorum_timeout_seconds),
         )
         self._manager.elastic_enabled = config.enable_elastic
+        if worker_dir is not None:
+            preempt.record_worker(self._manager, worker_dir)
         self.replicate_pg = torchft.process_group.ManagedProcessGroup(self._manager)
         self.replicate_pg.register("dp_replicate")
 

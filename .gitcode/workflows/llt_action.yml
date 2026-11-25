@@ -58,6 +58,12 @@ jobs:
           export MERGE_ID=${{ env.MERGE_ID }}
           export repo_name=${{ env.repo_name }}
           bash torchtitan-npu_ut.sh
+      - name: Test torchft Lighthouse patch
+        run: |
+          cd ${{ steps.process_checkout.outputs.path }} || exit 1
+          if grep -Eq 'torchft-0\.2\.0-lighthouse-preemption\.patch|test_torchft_preemption_patch\.sh' pr_filelist.txt; then
+            bash .ci/test_torchft_preemption_patch.sh
+          fi
       # -
       #   name: UT_Cov
       #   identifier: ut_cov

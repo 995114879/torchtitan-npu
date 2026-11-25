@@ -4,6 +4,20 @@
 import subprocess
 import sys
 
+import pytest
+
+
+@pytest.mark.parametrize(("enabled", "minimum"), [(False, 2), (True, 1), (True, 2)])
+def test_minimum_replicas_leave_room_for_preemption(enabled, minimum):
+    from torchtitan_npu.extensions.torchtitan.experiments.torchft.ft_manager import FTManagerEx
+
+    config = FTManagerEx.Config(replica_id=0, group_size=2, min_replica_size=minimum, enable_preemption=enabled)
+    if enabled and minimum == 2:
+        with pytest.raises(ValueError, match="min_replica_size"):
+            FTManagerEx.validate_config(config)
+    else:
+        FTManagerEx.validate_config(config)
+
 
 def test_synchronous_npu_manager_contract():
     program = """
